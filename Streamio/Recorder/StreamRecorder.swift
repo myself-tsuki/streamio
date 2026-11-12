@@ -2,183 +2,189 @@
 //  StreamRecorder.swift
 //  Streamio
 //
+//  Writes the program to disk. Video is passed through from the shared hardware encoder
+//  (no second encode); audio is encoded to AAC by AVAssetWriter from the mixer output.
+//
 
-import Foundation
 import AVFoundation
 import CoreMedia
+import Foundation
 
-public final class StreamRecorder: @unchecked Sendable {
-    public private(set) var isRecording = false
-    public private(set) var currentRecordingURL: URL?
-    public private(set) var recordingDuration: TimeInterval = 0.0
-    public private(set) var recordedBytes: UInt64 = 0
+nonisolated public final class StreamRecorder: @unchecked Sendable {
+    public struct Settings: Sendable {
+        public var directory: URL
+        public var format: RecordingFormat
+        public var audioBitrate: AudioBitrate
 
-    private var assetWriter: AVAssetWriter?
+        public init(directory: URL, format: RecordingFormat, audioBitrate: AudioBitrate) {
+            self.directory = directory
+            self.format = format
+            self.audioBitrate = audioBitrate
+        }
+    }
+
+    public enum Event: Sendable {
+        case started(URL)
+        case finished(URL)
+        case failed(String)
+    }
+
+    public var onEvent: (@Sendable (Event) -> Void)?
+
+    private let queue = DispatchQueue(label: "com.streamio.recorder", qos: .utility)
+
+    // Confined to `queue`.
+    private var settings: Settings?
+    private var outputURL: URL?
+    private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
-    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-
-    private var sessionStartTime: CMTime = .invalid
-    private var recordingTimer: Timer?
-    private let recordingQueue = DispatchQueue(label: "com.streamio.recorder", qos: .utility)
+    private var sessionStart: CMTime?
+    private var isActive = false
 
     public init() {}
 
-    public func startRecording(width: Int32,
-                               height: Int32,
-                               bitrate: Int,
-                               fps: Int,
-                               audioAsbd: AudioStreamBasicDescription? = nil,
-                               destinationDirectory: URL? = nil) throws -> URL {
-        let directory = destinationDirectory ?? FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
-
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let filename = "Streamio_Recording_\(formatter.string(from: Date())).mp4"
-        let outputURL = directory.appendingPathComponent(filename)
-
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            try? FileManager.default.removeItem(at: outputURL)
+    /// Prepares a new file. The writer itself is created on the first key frame,
+    /// because pass-through video needs the encoder's format description.
+    public func start(_ settings: Settings) throws -> URL {
+        try FileManager.default.createDirectory(at: settings.directory, withIntermediateDirectories: true)
+        let url = settings.directory.appending(path: Self.fileName(format: settings.format))
+        queue.sync {
+            self.settings = settings
+            outputURL = url
+            writer = nil
+            videoInput = nil
+            audioInput = nil
+            sessionStart = nil
+            isActive = true
         }
+        return url
+    }
 
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+    public func appendVideo(_ frame: EncodedVideoFrame) {
+        queue.async { [self] in
+            guard isActive else { return }
+            if writer == nil {
+                guard frame.isKeyFrame else { return }
+                guard createWriter(for: frame.sampleBuffer) else { return }
+            }
+            guard let writer, writer.status == .writing, let videoInput else {
+                reportFailureIfNeeded()
+                return
+            }
+            if sessionStart == nil {
+                let start = CMSampleBufferGetPresentationTimeStamp(frame.sampleBuffer)
+                writer.startSession(atSourceTime: start)
+                sessionStart = start
+                if let outputURL { onEvent?(.started(outputURL)) }
+            }
+            if videoInput.isReadyForMoreMediaData {
+                videoInput.append(frame.sampleBuffer)
+            }
+        }
+    }
 
-        // Video input settings
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: bitrate,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                AVVideoExpectedSourceFrameRateKey: fps,
-                AVVideoMaxKeyFrameIntervalKey: fps * 2
+    public func appendAudio(_ buffer: AVAudioPCMBuffer, time: Double) {
+        // Copy the PCM out of the mixer's buffer now; it is reused once we return.
+        guard let sampleBuffer = PCMSampleBufferFactory.makeSampleBuffer(from: buffer, time: time) else { return }
+        nonisolated(unsafe) let sample = sampleBuffer
+        queue.async { [self] in
+            guard isActive, let writer, writer.status == .writing, let audioInput, let sessionStart else { return }
+            guard CMSampleBufferGetPresentationTimeStamp(sample) >= sessionStart else { return }
+            if audioInput.isReadyForMoreMediaData {
+                audioInput.append(sample)
+            }
+        }
+    }
+
+    public func stop() {
+        queue.async { [self] in
+            guard isActive else { return }
+            isActive = false
+            guard let writer, writer.status == .writing, sessionStart != nil else {
+                writer?.cancelWriting()
+                if let outputURL { try? FileManager.default.removeItem(at: outputURL) }
+                resetState()
+                onEvent?(.failed(String(localized: "Recording stopped before any video was written.")))
+                return
+            }
+            videoInput?.markAsFinished()
+            audioInput?.markAsFinished()
+            let url = outputURL
+            writer.finishWriting { [self] in
+                queue.async { [self] in
+                    if writer.status == .completed, let url {
+                        onEvent?(.finished(url))
+                    } else {
+                        onEvent?(.failed(writer.error?.localizedDescription ?? String(localized: "The recording could not be finalised.")))
+                    }
+                    resetState()
+                }
+            }
+        }
+    }
+
+    // MARK: - Private
+
+    private func createWriter(for sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let settings, let outputURL,
+              let formatHint = CMSampleBufferGetFormatDescription(sampleBuffer) else { return false }
+        do {
+            let writer = try AVAssetWriter(outputURL: outputURL, fileType: settings.format.fileType)
+            writer.shouldOptimizeForNetworkUse = settings.format == .mp4
+
+            let video = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: formatHint)
+            video.expectsMediaDataInRealTime = true
+            guard writer.canAdd(video) else { throw CocoaError(.fileWriteUnknown) }
+            writer.add(video)
+
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: AudioMixer.sampleRate,
+                AVNumberOfChannelsKey: Int(AudioMixer.channelCount),
+                AVEncoderBitRateKey: settings.audioBitrate.rawValue
             ]
-        ]
-
-        let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        vInput.expectsMediaDataInRealTime = true
-
-        let sourcePixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height
-        ]
-
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: vInput,
-            sourcePixelBufferAttributes: sourcePixelBufferAttributes
-        )
-
-        if writer.canAdd(vInput) {
-            writer.add(vInput)
-        }
-
-        // Audio input settings
-        let audioSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: 44100.0,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 160000
-        ]
-
-        let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-        aInput.expectsMediaDataInRealTime = true
-
-        if writer.canAdd(aInput) {
-            writer.add(aInput)
-        }
-
-        writer.startWriting()
-
-        self.assetWriter = writer
-        self.videoInput = vInput
-        self.audioInput = aInput
-        self.pixelBufferAdaptor = adaptor
-        self.sessionStartTime = .invalid
-        self.currentRecordingURL = outputURL
-        self.isRecording = true
-        self.recordingDuration = 0.0
-        self.recordedBytes = 0
-
-        DispatchQueue.main.async { [weak self] in
-            self?.recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-                guard let self = self, self.isRecording else { return }
-                self.recordingDuration += 1.0
-                if let path = self.currentRecordingURL?.path,
-                   let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-                   let size = attrs[.size] as? UInt64 {
-                    self.recordedBytes = size
-                }
-            }
-        }
-
-        return outputURL
-    }
-
-    public func appendVideoPixelBuffer(_ pixelBuffer: CVPixelBuffer, at timestamp: CMTime) {
-        recordingQueue.async { [weak self] in
-            guard let self = self, self.isRecording, let writer = self.assetWriter else { return }
-
-            if writer.status == .unknown {
-                return
+            let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            audio.expectsMediaDataInRealTime = true
+            if writer.canAdd(audio) {
+                writer.add(audio)
+                audioInput = audio
             }
 
-            if !self.sessionStartTime.isValid {
-                self.sessionStartTime = timestamp
-                writer.startSession(atSourceTime: timestamp)
+            guard writer.startWriting() else {
+                throw writer.error ?? CocoaError(.fileWriteUnknown)
             }
-
-            guard let adaptor = self.pixelBufferAdaptor, adaptor.assetWriterInput.isReadyForMoreMediaData else {
-                return
-            }
-
-            adaptor.append(pixelBuffer, withPresentationTime: timestamp)
+            self.writer = writer
+            videoInput = video
+            return true
+        } catch {
+            isActive = false
+            onEvent?(.failed(error.localizedDescription))
+            resetState()
+            return false
         }
     }
 
-    public func appendAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-        recordingQueue.async { [weak self] in
-            guard let self = self, self.isRecording, let writer = self.assetWriter, let aInput = self.audioInput else { return }
-
-            if !self.sessionStartTime.isValid {
-                return
-            }
-
-            if aInput.isReadyForMoreMediaData {
-                aInput.append(sampleBuffer)
-            }
-        }
+    private func reportFailureIfNeeded() {
+        guard let writer, writer.status == .failed else { return }
+        isActive = false
+        onEvent?(.failed(writer.error?.localizedDescription ?? String(localized: "The recording failed.")))
+        resetState()
     }
 
-    public func stopRecording(completion: (@Sendable (URL?) -> Void)? = nil) {
-        recordingQueue.async { [weak self] in
-            guard let self = self, self.isRecording, let writer = self.assetWriter else {
-                DispatchQueue.main.async { completion?(nil) }
-                return
-            }
+    private func resetState() {
+        writer = nil
+        videoInput = nil
+        audioInput = nil
+        sessionStart = nil
+        outputURL = nil
+    }
 
-            self.isRecording = false
-
-            DispatchQueue.main.async {
-                self.recordingTimer?.invalidate()
-                self.recordingTimer = nil
-            }
-
-            self.videoInput?.markAsFinished()
-            self.audioInput?.markAsFinished()
-
-            let outputURL = self.currentRecordingURL
-            writer.finishWriting {
-                self.assetWriter = nil
-                self.videoInput = nil
-                self.audioInput = nil
-                self.pixelBufferAdaptor = nil
-                DispatchQueue.main.async {
-                    completion?(outputURL)
-                }
-            }
-        }
+    static func fileName(format: RecordingFormat, date: Date = .now) -> String {
+        // Fixed, sortable, filesystem-safe pattern (not user-facing date formatting).
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH-mm-ss"
+        return "Streamio \(formatter.string(from: date)).\(format.rawValue)"
     }
 }
-

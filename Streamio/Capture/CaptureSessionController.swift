@@ -2,211 +2,171 @@
 //  CaptureSessionController.swift
 //  Streamio
 //
+//  AVFoundation capture for the camera (video) and microphone (Mic/Aux audio).
+//  Configuration runs on a private session queue; sample buffers arrive on dedicated queues.
+//
 
-import Foundation
 import AVFoundation
 import CoreMedia
-import Accelerate
+import Foundation
 
-public protocol CaptureSessionDelegate: AnyObject {
-    func captureSession(_ controller: CaptureSessionController, didOutputVideoSampleBuffer sampleBuffer: CMSampleBuffer)
-    func captureSession(_ controller: CaptureSessionController, didOutputAudioSampleBuffer sampleBuffer: CMSampleBuffer)
-}
+nonisolated public final class CaptureSessionController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate,
+    AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
 
-public final class CaptureSessionController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
-    public weak var delegate: CaptureSessionDelegate?
+    public var onVideo: (@Sendable (CMSampleBuffer) -> Void)?
+    public var onAudio: (@Sendable (CMSampleBuffer) -> Void)?
+    public var onError: (@Sendable (String) -> Void)?
 
-    private let captureSession = AVCaptureSession()
-    private let videoDataOutput = AVCaptureVideoDataOutput()
-    private let audioDataOutput = AVCaptureAudioDataOutput()
-
-    private let videoQueue = DispatchQueue(label: "com.streamio.videoqueue", qos: .userInteractive)
-    private let audioQueue = DispatchQueue(label: "com.streamio.audioqueue", qos: .userInteractive)
-    private let sessionQueue = DispatchQueue(label: "com.streamio.sessionqueue", qos: .userInitiated)
+    private let session = AVCaptureSession()
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let audioOutput = AVCaptureAudioDataOutput()
+    private let sessionQueue = DispatchQueue(label: "com.streamio.capture.session", qos: .userInitiated)
+    private let videoQueue = DispatchQueue(label: "com.streamio.capture.video", qos: .userInteractive)
+    private let audioQueue = DispatchQueue(label: "com.streamio.capture.audio", qos: .userInteractive)
 
     private var videoInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
-
-    private var currentResolution: VideoResolution = .res1080p
-    private var currentFps: FrameRate = .fps30
-
-    // Callback for live VU meter (dB)
-    public var onAudioLevelsUpdated: ((Float, Float) -> Void)?
+    private var runtimeErrorObserver: NSObjectProtocol?
 
     public override init() {
         super.init()
-    }
+        sessionQueue.async { [self] in
+            session.beginConfiguration()
+            session.sessionPreset = .inputPriority
 
-    public func startSession() {
-        sessionQueue.async { [weak self] in
-            guard let self = self else { return }
-            if !self.captureSession.isRunning {
-                self.captureSession.startRunning()
-            }
+            videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            videoOutput.alwaysDiscardsLateVideoFrames = true
+            videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+            if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
+
+            // macOS lets us ask for the mixer's native format directly, saving a conversion.
+            audioOutput.audioSettings = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: AudioMixer.sampleRate,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsNonInterleaved: true
+            ]
+            audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
+            if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
+            session.commitConfiguration()
+        }
+
+        runtimeErrorObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
+        ) { [weak self] notification in
+            let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
+            self?.onError?(error?.localizedDescription ?? String(localized: "The capture session stopped unexpectedly."))
         }
     }
 
-    public func stopSession() {
-        sessionQueue.async { [weak self] in
-            guard let self = self else { return }
-            if self.captureSession.isRunning {
-                self.captureSession.stopRunning()
-            }
+    deinit {
+        if let runtimeErrorObserver {
+            NotificationCenter.default.removeObserver(runtimeErrorObserver)
         }
     }
 
-    public func configureSession(videoDevice: AVCaptureDevice?,
-                                 audioDevice: AVCaptureDevice?,
-                                 resolution: VideoResolution,
-                                 frameRate: FrameRate) {
-        sessionQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.currentResolution = resolution
-            self.currentFps = frameRate
+    /// Swaps inputs. Pass nil to remove the camera (e.g. a display scene) or the microphone.
+    public func configure(camera: AVCaptureDevice?, microphone: AVCaptureDevice?, canvasWidth: Int, canvasHeight: Int, fps: Int) {
+        sessionQueue.async { [self] in
+            session.beginConfiguration()
 
-            self.captureSession.beginConfiguration()
-
-            // 1. Configure Resolution Preset
-            if self.captureSession.canSetSessionPreset(resolution.preset) {
-                self.captureSession.sessionPreset = resolution.preset
-            } else if self.captureSession.canSetSessionPreset(.high) {
-                self.captureSession.sessionPreset = .high
-            }
-
-            // 2. Video Device Input
-            if let currentVideo = self.videoInput {
-                self.captureSession.removeInput(currentVideo)
-                self.videoInput = nil
-            }
-
-            if let videoDevice = videoDevice,
-               let newVideoInput = try? AVCaptureDeviceInput(device: videoDevice),
-               self.captureSession.canAddInput(newVideoInput) {
-                self.captureSession.addInput(newVideoInput)
-                self.videoInput = newVideoInput
-
-                // Set framerate on active video device
-                self.applyFrameRate(frameRate, to: videoDevice)
-            }
-
-            // 3. Audio Device Input
-            if let currentAudio = self.audioInput {
-                self.captureSession.removeInput(currentAudio)
-                self.audioInput = nil
-            }
-
-            if let audioDevice = audioDevice,
-               let newAudioInput = try? AVCaptureDeviceInput(device: audioDevice),
-               self.captureSession.canAddInput(newAudioInput) {
-                self.captureSession.addInput(newAudioInput)
-                self.audioInput = newAudioInput
-            }
-
-            // 4. Video Output
-            if !self.captureSession.outputs.contains(self.videoDataOutput) {
-                self.videoDataOutput.videoSettings = [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-                ]
-                self.videoDataOutput.alwaysDiscardsLateVideoFrames = true
-                self.videoDataOutput.setSampleBufferDelegate(self, queue: self.videoQueue)
-                if self.captureSession.canAddOutput(self.videoDataOutput) {
-                    self.captureSession.addOutput(self.videoDataOutput)
-                }
-            }
-
-            // 5. Audio Output
-            if !self.captureSession.outputs.contains(self.audioDataOutput) {
-                self.audioDataOutput.setSampleBufferDelegate(self, queue: self.audioQueue)
-                if self.captureSession.canAddOutput(self.audioDataOutput) {
-                    self.captureSession.addOutput(self.audioDataOutput)
-                }
-            }
-
-            self.captureSession.commitConfiguration()
-
-            if !self.captureSession.isRunning {
-                self.captureSession.startRunning()
-            }
-        }
-    }
-
-    private func applyFrameRate(_ frameRate: FrameRate, to device: AVCaptureDevice) {
-        do {
-            try device.lockForConfiguration()
-            let desiredDuration = CMTime(value: 1, timescale: CMTimeScale(frameRate.rawValue))
-            
-            // Find format matching framerate or adjust activeVideoMinFrameDuration
-            var bestFormat: AVCaptureDevice.Format?
-            for format in device.formats {
-                for range in format.videoSupportedFrameRateRanges {
-                    if range.minFrameRate <= Double(frameRate.rawValue) && Double(frameRate.rawValue) <= range.maxFrameRate {
-                        bestFormat = format
-                        break
+            if videoInput?.device != camera {
+                if let videoInput { session.removeInput(videoInput) }
+                videoInput = nil
+                if let camera {
+                    do {
+                        let input = try AVCaptureDeviceInput(device: camera)
+                        if session.canAddInput(input) {
+                            session.addInput(input)
+                            videoInput = input
+                        }
+                    } catch {
+                        onError?(error.localizedDescription)
                     }
                 }
-                if bestFormat != nil { break }
+            }
+            if let camera = videoInput?.device {
+                Self.applyBestFormat(to: camera, width: canvasWidth, height: canvasHeight, fps: fps)
             }
 
-            if let format = bestFormat, device.activeFormat != format {
-                device.activeFormat = format
+            if audioInput?.device != microphone {
+                if let audioInput { session.removeInput(audioInput) }
+                audioInput = nil
+                if let microphone {
+                    do {
+                        let input = try AVCaptureDeviceInput(device: microphone)
+                        if session.canAddInput(input) {
+                            session.addInput(input)
+                            audioInput = input
+                        }
+                    } catch {
+                        onError?(error.localizedDescription)
+                    }
+                }
             }
 
-            device.activeVideoMinFrameDuration = desiredDuration
-            device.activeVideoMaxFrameDuration = desiredDuration
-            device.unlockForConfiguration()
+            session.commitConfiguration()
+
+            let needsSession = videoInput != nil || audioInput != nil
+            if needsSession, !session.isRunning {
+                session.startRunning()
+            } else if !needsSession, session.isRunning {
+                session.stopRunning()
+            }
+        }
+    }
+
+    public func stop() {
+        sessionQueue.async { [self] in
+            if session.isRunning { session.stopRunning() }
+        }
+    }
+
+    /// Picks the smallest format that covers the canvas at the requested frame rate,
+    /// falling back to the largest one available, then locks the frame duration.
+    static func applyBestFormat(to device: AVCaptureDevice, width: Int, height: Int, fps: Int) {
+        let rate = Double(fps)
+        let supportsRate: (AVCaptureDevice.Format) -> Bool = { format in
+            format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= rate && rate <= $0.maxFrameRate }
+        }
+        let candidates = device.formats.filter(supportsRate)
+        let pool = candidates.isEmpty ? device.formats : candidates
+
+        func area(_ format: AVCaptureDevice.Format) -> Int32 {
+            let size = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return size.width * size.height
+        }
+        let covering = pool.filter {
+            let size = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+            return Int(size.width) >= width && Int(size.height) >= height
+        }
+        let chosen = covering.min { area($0) < area($1) } ?? pool.max { area($0) < area($1) }
+        guard let chosen else { return }
+
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.activeFormat != chosen {
+                device.activeFormat = chosen
+            }
+            if supportsRate(chosen) {
+                let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
+                device.activeVideoMinFrameDuration = duration
+                device.activeVideoMaxFrameDuration = duration
+            }
         } catch {
-            print("Failed to lock device for configuration: \(error)")
+            // The device is in use elsewhere; it keeps its current format.
         }
     }
 
-    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+    // MARK: - Sample buffer delegate
+
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        if output == videoDataOutput {
-            delegate?.captureSession(self, didOutputVideoSampleBuffer: sampleBuffer)
-        } else if output == audioDataOutput {
-            calculateAudioLevels(sampleBuffer: sampleBuffer)
-            delegate?.captureSession(self, didOutputAudioSampleBuffer: sampleBuffer)
+        if output === videoOutput {
+            onVideo?(sampleBuffer)
+        } else if output === audioOutput {
+            onAudio?(sampleBuffer)
         }
-    }
-
-    private func calculateAudioLevels(sampleBuffer: CMSampleBuffer) {
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-        var lengthAtOffset: Int = 0
-        var totalLength: Int = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-
-        let status = CMBlockBufferGetDataPointer(
-            blockBuffer,
-            atOffset: 0,
-            lengthAtOffsetOut: &lengthAtOffset,
-            totalLengthOut: &totalLength,
-            dataPointerOut: &dataPointer
-        )
-
-        guard status == noErr, let rawData = dataPointer, totalLength > 0 else { return }
-
-        // Audio format extraction
-        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee else {
-            return
-        }
-
-        let channelCount = Int(asbd.mChannelsPerFrame)
-        let sampleCount = totalLength / (MemoryLayout<Int16>.size * max(1, channelCount))
-        guard sampleCount > 0 else { return }
-
-        let samples = rawData.withMemoryRebound(to: Int16.self, capacity: totalLength / MemoryLayout<Int16>.size) { ptr in
-            Array(UnsafeBufferPointer(start: ptr, count: min(sampleCount * max(1, channelCount), 1024)))
-        }
-
-        var floatSamples = samples.map { Float($0) / 32768.0 }
-        var rms: Float = 0.0
-        vDSP_rmsqv(&floatSamples, 1, &rms, vDSP_Length(floatSamples.count))
-
-        var db = 20.0 * log10(max(rms, 0.0001))
-        db = max(-60.0, min(0.0, db))
-
-        onAudioLevelsUpdated?(db, db)
     }
 }
-
