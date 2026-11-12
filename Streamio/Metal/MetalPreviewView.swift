@@ -2,81 +2,67 @@
 //  MetalPreviewView.swift
 //  Streamio
 //
+//  The program preview. The MTKView ticks at the canvas frame rate but only encodes
+//  GPU work when the pipeline has published a new frame.
+//
 
-import SwiftUI
 import MetalKit
-import CoreVideo
+import SwiftUI
 
-public struct MetalPreviewView: NSViewRepresentable {
-    public class Coordinator: NSObject, MTKViewDelegate {
-        var parent: MetalPreviewView
-        var currentPixelBuffer: CVPixelBuffer?
-        private let lock = NSLock()
+struct MetalPreviewView: NSViewRepresentable {
+    let store: PreviewFrameStore
+    let fps: Int
 
-        init(parent: MetalPreviewView) {
-            self.parent = parent
+    func makeCoordinator() -> Coordinator {
+        Coordinator(store: store)
+    }
+
+    func makeNSView(context: Context) -> MTKView {
+        let view = MTKView(frame: .zero, device: MetalPipeline.shared.device)
+        view.delegate = context.coordinator
+        view.colorPixelFormat = .bgra8Unorm
+        view.framebufferOnly = true
+        view.enableSetNeedsDisplay = false
+        view.isPaused = false
+        view.preferredFramesPerSecond = fps
+        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        view.layer?.isOpaque = false
+        view.setAccessibilityElement(true)
+        view.setAccessibilityRole(.image)
+        view.setAccessibilityLabel(String(localized: "Program preview"))
+        return view
+    }
+
+    func updateNSView(_ view: MTKView, context: Context) {
+        if view.preferredFramesPerSecond != fps {
+            view.preferredFramesPerSecond = fps
+        }
+        context.coordinator.store = store
+    }
+
+    /// MTKView calls its delegate on the main thread.
+    final class Coordinator: NSObject, MTKViewDelegate {
+        var store: PreviewFrameStore
+        private var lastGeneration: UInt64 = 0
+        private var needsRedraw = true
+
+        init(store: PreviewFrameStore) {
+            self.store = store
         }
 
-        public func updateFrame(_ pixelBuffer: CVPixelBuffer) {
-            lock.lock()
-            self.currentPixelBuffer = pixelBuffer
-            lock.unlock()
+        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+            needsRedraw = true
         }
 
-        public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
-
-        public func draw(in view: MTKView) {
-            lock.lock()
-            let buffer = currentPixelBuffer
-            lock.unlock()
-
-            guard let pixelBuffer = buffer else { return }
-
-            MetalPipeline.shared.renderToView(
-                pixelBuffer: pixelBuffer,
-                mtkView: view,
-                filter: parent.filter,
-                params: parent.filterParams
-            )
+        func draw(in view: MTKView) {
+            // After a resize, redraw the current frame even if it is not new.
+            let seen = needsRedraw ? UInt64.max : lastGeneration
+            guard let (frame, generation) = store.frame(newerThan: seen) else {
+                return // nothing new: the last presented image stays on screen
+            }
+            needsRedraw = false
+            lastGeneration = generation
+            MetalPipeline.shared.present(frame, in: view)
         }
-    }
-
-    public var filter: FilterType
-    public var filterParams: FilterParameters
-    public weak var previewRendererDelegate: MetalPreviewRendererDelegate?
-
-    public init(filter: FilterType,
-                filterParams: FilterParameters,
-                previewRendererDelegate: MetalPreviewRendererDelegate? = nil) {
-        self.filter = filter
-        self.filterParams = filterParams
-        self.previewRendererDelegate = previewRendererDelegate
-    }
-
-    public func makeCoordinator() -> Coordinator {
-        let coordinator = Coordinator(parent: self)
-        previewRendererDelegate?.registerPreviewCoordinator(coordinator)
-        return coordinator
-    }
-
-    public func makeNSView(context: Context) -> MTKView {
-        let mtkView = MTKView(frame: .zero, device: MetalPipeline.shared.device)
-        mtkView.delegate = context.coordinator
-        mtkView.enableSetNeedsDisplay = false
-        mtkView.isPaused = false
-        mtkView.preferredFramesPerSecond = 60
-        mtkView.clearColor = MTLClearColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0)
-        mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.framebufferOnly = false
-        return mtkView
-    }
-
-    public func updateNSView(_ nsView: MTKView, context: Context) {
-        context.coordinator.parent = self
     }
 }
-
-public protocol MetalPreviewRendererDelegate: AnyObject {
-    func registerPreviewCoordinator(_ coordinator: MetalPreviewView.Coordinator)
-}
-

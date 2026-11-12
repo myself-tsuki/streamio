@@ -2,562 +2,619 @@
 //  RTMPClient.swift
 //  Streamio
 //
+//  Publishing RTMP/RTMPS client built on Network.framework.
+//
+//  Every piece of mutable state is confined to `queue`; public entry points hop onto it.
+//  The client implements the full publish handshake (connect → createStream → publish),
+//  answers pings and acknowledgement windows, applies back-pressure by dropping
+//  non-key video frames when the socket falls behind, and reconnects automatically.
+//
 
 import Foundation
 import Network
-import CoreMedia
 
-public protocol RTMPClientDelegate: AnyObject {
-    func rtmpClientDidChangeStatus(_ client: RTMPClient, status: StreamStatus)
-    func rtmpClientDidUpdateStatistics(_ client: RTMPClient, bytesSent: UInt64, bitrateKbps: Double, droppedFrames: Int)
-}
+nonisolated public final class RTMPClient: @unchecked Sendable {
+    public struct Configuration: Sendable {
+        public var endpoint: RTMPEndpoint
+        public var streamKey: String
+        public var width: Int
+        public var height: Int
+        public var fps: Int
+        public var videoBitrate: Int
+        public var audioBitrate: Int
+        public var audioSampleRate: Double
+        public var videoFormat: FLVVideoFormat
+        public var autoReconnect: Bool
+        public var maxReconnectAttempts: Int
+        public var reconnectDelay: Duration
 
-public final class RTMPClient: @unchecked Sendable {
-    public weak var delegate: RTMPClientDelegate?
-
-    public private(set) var status: StreamStatus = .idle {
-        didSet {
-            delegate?.rtmpClientDidChangeStatus(self, status: status)
+        public init(endpoint: RTMPEndpoint, streamKey: String, width: Int, height: Int, fps: Int,
+                    videoBitrate: Int, audioBitrate: Int, audioSampleRate: Double, videoFormat: FLVVideoFormat,
+                    autoReconnect: Bool, maxReconnectAttempts: Int, reconnectDelay: Duration) {
+            self.endpoint = endpoint
+            self.streamKey = streamKey
+            self.width = width
+            self.height = height
+            self.fps = fps
+            self.videoBitrate = videoBitrate
+            self.audioBitrate = audioBitrate
+            self.audioSampleRate = audioSampleRate
+            self.videoFormat = videoFormat
+            self.autoReconnect = autoReconnect
+            self.maxReconnectAttempts = maxReconnectAttempts
+            self.reconnectDelay = reconnectDelay
         }
     }
 
+    public struct Statistics: Equatable, Sendable {
+        public var bytesSent: UInt64 = 0
+        public var bitrateKbps: Double = 0
+        public var sentVideoFrames = 0
+        public var droppedVideoFrames = 0
+        /// 0 = socket keeping up, 1 = send buffer at its drop threshold.
+        public var congestion: Double = 0
+    }
+
+    public enum Event: Sendable {
+        case status(StreamStatus)
+        case statistics(Statistics)
+    }
+
+    private enum Phase {
+        case idle
+        case handshaking
+        case connecting
+        case creatingStream
+        case publishing
+        case live
+    }
+
+    /// Called on the client's private queue. Set before `connect`.
+    public var onEvent: (@Sendable (Event) -> Void)?
+    /// Asks the video encoder for an IDR frame (stream start, after drops).
+    public var onKeyFrameRequest: (@Sendable () -> Void)?
+
+    private let queue = DispatchQueue(label: "com.streamio.rtmp", qos: .userInitiated)
+
+    // Connection
+    private var configuration: Configuration?
     private var connection: NWConnection?
-    private let networkQueue = DispatchQueue(label: "com.streamio.rtmpclient", qos: .userInitiated)
+    private var generation = 0
+    private var phase: Phase = .idle
+    private var reader = RTMPChunkReader()
+    private var handshakeBuffer = Data()
+    private var outgoingChunkSize = 4096
+    private var reconnectAttempts = 0
+    private var userRequestedStop = false
 
-    // Stream parameters
-    private var rtmpUrlString: String = "rtmp://a.rtmp.youtube.com/live2"
-    private var streamKey: String = ""
-    private var appName: String = "live2"
-    private var host: String = "a.rtmp.youtube.com"
-    private var port: UInt16 = 1935
-    private var isSecure: Bool = false
+    // Protocol bookkeeping
+    private var nextTransactionID = 1.0
+    private var connectTransactionID = 0.0
+    private var createStreamTransactionID = 0.0
+    private var messageStreamID: UInt32 = 1
+    private var serverWindowAckSize: UInt32 = 2_500_000
+    private var bytesReceived: UInt64 = 0
+    private var lastAcknowledged: UInt64 = 0
 
-    private var videoWidth: Int32 = 1920
-    private var videoHeight: Int32 = 1080
-    private var videoBitrate: Int = 4_500_000
-    private var audioBitrate: Int = 128_000
-    private var fps: Int = 30
+    // Media
+    private var videoSequenceHeader: Data?
+    private var audioSequenceHeader: Data?
+    private var timeBase: Double?
+    private var lastVideoTimestamp: UInt32 = 0
+    private var lastAudioTimestamp: UInt32 = 0
+    private var waitingForKeyFrame = true
 
-    // RTMP Protocol State
-    private var chunkSize: Int = 4096
-    private var messageStreamId: UInt32 = 1
-    private var currentTransactionId: Double = 1.0
-
-    // Time tracking
-    private var startTime: CMTime = .invalid
-    private var hasPublished = false
-
-    // Cached headers
-    private var cachedAVCSequenceHeader: Data?
-    private var cachedAACSequenceHeader: Data?
-
-    // Statistics
-    private var totalBytesSent: UInt64 = 0
+    // Flow control and statistics
+    private var bytesInFlight = 0
+    private var stats = Statistics()
     private var lastStatsBytes: UInt64 = 0
-    private var lastStatsDate = Date()
-    private var droppedFramesCount = 0
-    private var statsTimer: Timer?
+    private var lastStatsTime = ContinuousClock.now
+    private var statsTimer: DispatchSourceTimer?
 
     public init() {}
 
     deinit {
-        disconnect()
+        statsTimer?.cancel()
+        connection?.cancel()
     }
 
-    public func configure(
-        rtmpUrl: String,
-        streamKey: String,
-        width: Int32,
-        height: Int32,
-        videoBitrate: Int,
-        audioBitrate: Int,
-        fps: Int
-    ) {
-        self.rtmpUrlString = rtmpUrl.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.streamKey = streamKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.videoWidth = width
-        self.videoHeight = height
-        self.videoBitrate = videoBitrate
-        self.audioBitrate = audioBitrate
-        self.fps = fps
+    // MARK: - Public API
 
-        parseUrl()
-    }
-
-    private func parseUrl() {
-        guard let url = URL(string: rtmpUrlString) else { return }
-        self.host = url.host ?? "a.rtmp.youtube.com"
-        self.isSecure = (url.scheme?.lowercased() == "rtmps")
-        self.port = UInt16(url.port ?? (isSecure ? 443 : 1935))
-
-        let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        self.appName = path.isEmpty ? "live2" : path
-    }
-
-    public func connect() {
-        networkQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.disconnectInternal()
-
-            self.status = .connecting
-            self.totalBytesSent = 0
-            self.lastStatsBytes = 0
-            self.droppedFramesCount = 0
-            self.startTime = .invalid
-            self.hasPublished = false
-            self.currentTransactionId = 1.0
-
-            let hostEndpoint = NWEndpoint.Host(self.host)
-            guard let portEndpoint = NWEndpoint.Port(rawValue: self.port) else {
-                self.status = .error("Invalid port: \(self.port)")
-                return
-            }
-
-            let parameters: NWParameters
-            if self.isSecure {
-                parameters = .tls
-            } else {
-                parameters = .tcp
-            }
-            parameters.allowFastOpen = true
-
-            let conn = NWConnection(host: hostEndpoint, port: portEndpoint, using: parameters)
-            self.connection = conn
-
-            conn.stateUpdateHandler = { [weak self] state in
-                self?.handleStateUpdate(state)
-            }
-
-            conn.start(queue: self.networkQueue)
-            self.startStatsTimer()
+    public func connect(_ configuration: Configuration) {
+        queue.async { [self] in
+            self.configuration = configuration
+            userRequestedStop = false
+            reconnectAttempts = 0
+            stats = Statistics()
+            lastStatsBytes = 0
+            openConnection()
+            startStatsTimer()
         }
     }
 
-    private func handleStateUpdate(_ state: NWConnection.State) {
+    public func disconnect() {
+        queue.async { [self] in
+            userRequestedStop = true
+            closeConnection(sendingUnpublish: phase == .live)
+            statsTimer?.cancel()
+            statsTimer = nil
+            setStatus(.idle)
+        }
+    }
+
+    /// `avcC` / `hvcC` decoder configuration record from the encoder.
+    public func setVideoSequenceHeader(_ configurationRecord: Data) {
+        queue.async { [self] in
+            let format = configuration?.videoFormat ?? .avc
+            let tag = FLVTag.videoSequenceHeader(format: format, configurationRecord: configurationRecord)
+            let changed = videoSequenceHeader != tag
+            videoSequenceHeader = tag
+            if phase == .live, changed {
+                sendMessage(type: .video, csid: RTMPChunkStream.video, timestamp: lastVideoTimestamp, payload: tag)
+            }
+        }
+    }
+
+    public func setAudioSequenceHeader(_ audioSpecificConfig: Data) {
+        queue.async { [self] in
+            let tag = FLVTag.makeAACSequenceHeader(config: audioSpecificConfig)
+            audioSequenceHeader = tag
+            if phase == .live {
+                sendMessage(type: .audio, csid: RTMPChunkStream.audio, timestamp: lastAudioTimestamp, payload: tag)
+            }
+        }
+    }
+
+    /// Sends one encoded access unit. `pts`/`dts` are host-clock seconds.
+    public func sendVideo(accessUnit: Data, pts: Double, dts: Double, isKeyFrame: Bool) {
+        queue.async { [self] in
+            guard phase == .live, let configuration else { return }
+
+            if waitingForKeyFrame && !isKeyFrame {
+                stats.droppedVideoFrames += 1
+                return
+            }
+            if bytesInFlight > dropThreshold, !isKeyFrame {
+                // Socket can't keep up: skip until the next IDR so the decoder never sees a broken GOP.
+                stats.droppedVideoFrames += 1
+                if !waitingForKeyFrame {
+                    waitingForKeyFrame = true
+                    onKeyFrameRequest?()
+                }
+                return
+            }
+            waitingForKeyFrame = false
+
+            let timestamp = mediaTimestamp(for: dts, last: &lastVideoTimestamp)
+            let composition = Int32(((pts - dts) * 1000).rounded())
+            let tag = FLVTag.videoFrame(format: configuration.videoFormat, accessUnit: accessUnit,
+                                        isKeyFrame: isKeyFrame, compositionTimeMs: composition)
+            sendMessage(type: .video, csid: RTMPChunkStream.video, timestamp: timestamp, payload: tag)
+            stats.sentVideoFrames += 1
+        }
+    }
+
+    public func sendAudio(aacPacket: Data, pts: Double) {
+        queue.async { [self] in
+            guard phase == .live else { return }
+            // Audio is tiny; only shed it when the socket is hopelessly behind.
+            guard bytesInFlight < dropThreshold * 4 else { return }
+            let timestamp = mediaTimestamp(for: pts, last: &lastAudioTimestamp)
+            sendMessage(type: .audio, csid: RTMPChunkStream.audio, timestamp: timestamp,
+                        payload: FLVTag.makeAACPacket(aacData: aacPacket))
+        }
+    }
+
+    // MARK: - Connection lifecycle
+
+    private var dropThreshold: Int {
+        let bitrate = configuration?.videoBitrate ?? 4_500_000
+        // About two seconds of video may sit in the send buffer before we start dropping.
+        return max(512 * 1024, bitrate / 8 * 2)
+    }
+
+    private func openConnection() {
+        guard let configuration else { return }
+        closeConnection(sendingUnpublish: false)
+
+        generation += 1
+        let currentGeneration = generation
+        phase = .handshaking
+        reader = RTMPChunkReader()
+        handshakeBuffer = Data()
+        bytesInFlight = 0
+        bytesReceived = 0
+        lastAcknowledged = 0
+        nextTransactionID = 1
+        timeBase = nil
+        lastVideoTimestamp = 0
+        lastAudioTimestamp = 0
+        waitingForKeyFrame = true
+        setStatus(reconnectAttempts > 0 ? .reconnecting : .connecting)
+
+        let endpoint = configuration.endpoint
+        guard let port = NWEndpoint.Port(rawValue: endpoint.port) else {
+            fail("Invalid port \(endpoint.port)")
+            return
+        }
+
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        tcp.enableKeepalive = true
+        let parameters = endpoint.isSecure ? NWParameters(tls: NWProtocolTLS.Options(), tcp: tcp) : NWParameters(tls: nil, tcp: tcp)
+        parameters.serviceClass = .responsiveData
+
+        let connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: port, using: parameters)
+        self.connection = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            self?.handleState(state, generation: currentGeneration)
+        }
+        connection.start(queue: queue)
+    }
+
+    private func closeConnection(sendingUnpublish: Bool) {
+        guard let connection else { return }
+        generation += 1
+        if sendingUnpublish {
+            sendUnpublish()
+            // Let the unpublish commands flush before tearing the socket down.
+            connection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        } else {
+            connection.cancel()
+        }
+        self.connection = nil
+        phase = .idle
+    }
+
+    private func handleState(_ state: NWConnection.State, generation: Int) {
+        guard generation == self.generation else { return }
         switch state {
         case .ready:
-            sendHandshake()
+            startHandshake()
+        case .waiting(let error):
+            connectionLost("Network unavailable: \(error.localizedDescription)")
         case .failed(let error):
-            self.status = .error("Connection failed: \(error.localizedDescription)")
-            self.disconnect()
-        case .cancelled:
-            if self.status != .idle {
-                self.status = .idle
-            }
+            connectionLost("Connection failed: \(error.localizedDescription)")
         default:
             break
         }
     }
 
-    // MARK: - RTMP Handshake
-    private func sendHandshake() {
-        var c0c1 = Data()
-        c0c1.append(0x03) // C0: RTMP version 3
+    private func connectionLost(_ reason: String) {
+        guard !userRequestedStop else { return }
+        closeConnection(sendingUnpublish: false)
 
-        // C1: 1536 bytes
-        var timeBytes: UInt32 = 0
-        c0c1.append(Data(bytes: &timeBytes, count: 4)) // 4 bytes timestamp (0)
-        var zeroBytes: UInt32 = 0
-        c0c1.append(Data(bytes: &zeroBytes, count: 4)) // 4 bytes zero
-
-        // 1528 random bytes
-        var randomBytes = [UInt8](repeating: 0, count: 1528)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 1528, &randomBytes)
-        c0c1.append(contentsOf: randomBytes)
-
-        sendRaw(c0c1)
-
-        // Read S0 + S1 + S2 (1 + 1536 + 1536 = 3073 bytes)
-        receiveExact(count: 3073) { [weak self] data in
-            guard let self = self, let sData = data, sData.count == 3073 else {
-                self?.status = .error("Handshake failed to receive S0-S2")
-                return
-            }
-
-            // Verify S0
-            guard sData[0] == 0x03 else {
-                self.status = .error("Unsupported RTMP server version")
-                return
-            }
-
-            // S1 is from byte 1..<1537
-            let s1 = sData.subdata(in: 1..<1537)
-            // Send C2 = echo of S1
-            self.sendRaw(s1)
-
-            // Handshake complete, send connect command
-            self.startRTMPConnectSession()
-        }
-    }
-
-    private func startRTMPConnectSession() {
-        // 1. Set Chunk Size to 4096
-        sendSetChunkSize(4096)
-
-        // 2. Send 'connect' command (AMF0)
-        sendConnectCommand()
-
-        // 3. Listen for responses
-        listenForServerMessages()
-    }
-
-    private func sendSetChunkSize(_ size: UInt32) {
-        self.chunkSize = Int(size)
-        var payload = Data()
-        var sizeBE = size.bigEndian
-        payload.append(Data(bytes: &sizeBE, count: 4))
-
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 2,
-            typeId: 1, // Set Chunk Size
-            streamId: 0,
-            timestamp: 0,
-            payload: payload,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-    }
-
-    private func sendConnectCommand() {
-        var amfPayload = Data()
-
-        // Command name
-        AMF0.encode(.string("connect"), into: &amfPayload)
-        // Transaction ID
-        currentTransactionId = 1.0
-        AMF0.encode(.number(currentTransactionId), into: &amfPayload)
-
-        let tcUrl = "\(isSecure ? "rtmps" : "rtmp")://\(host):\(port)/\(appName)"
-
-        // Command Object
-        let cmdObj: [String: AMF0Value] = [
-            "app": .string(appName),
-            "flashVer": .string("FMLE/3.0 (compatible; FMSc/1.0)"),
-            "tcUrl": .string(tcUrl),
-            "fpad": .boolean(false),
-            "capabilities": .number(15.0),
-            "audioCodecs": .number(3191.0),
-            "videoCodecs": .number(252.0),
-            "videoFunction": .number(1.0)
-        ]
-        AMF0.encode(.object(cmdObj), into: &amfPayload)
-
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 3,
-            typeId: 20, // AMF0 Command
-            streamId: 0,
-            timestamp: 0,
-            payload: amfPayload,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-
-        // Also send FMLE-style releaseStream and FCPublish (required by YouTube RTMP ingest)
-        sendReleaseStream()
-        sendFCPublish()
-        sendCreateStream()
-    }
-
-    private func sendReleaseStream() {
-        var amf = Data()
-        AMF0.encode(.string("releaseStream"), into: &amf)
-        currentTransactionId += 1
-        AMF0.encode(.number(currentTransactionId), into: &amf)
-        AMF0.encode(.null, into: &amf)
-        AMF0.encode(.string(streamKey), into: &amf)
-
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 3,
-            typeId: 20,
-            streamId: 0,
-            timestamp: 0,
-            payload: amf,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-    }
-
-    private func sendFCPublish() {
-        var amf = Data()
-        AMF0.encode(.string("FCPublish"), into: &amf)
-        currentTransactionId += 1
-        AMF0.encode(.number(currentTransactionId), into: &amf)
-        AMF0.encode(.null, into: &amf)
-        AMF0.encode(.string(streamKey), into: &amf)
-
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 3,
-            typeId: 20,
-            streamId: 0,
-            timestamp: 0,
-            payload: amf,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-    }
-
-    private func sendCreateStream() {
-        var amf = Data()
-        AMF0.encode(.string("createStream"), into: &amf)
-        currentTransactionId += 1
-        AMF0.encode(.number(currentTransactionId), into: &amf)
-        AMF0.encode(.null, into: &amf)
-
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 3,
-            typeId: 20,
-            streamId: 0,
-            timestamp: 0,
-            payload: amf,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-    }
-
-    private func sendPublish() {
-        var amf = Data()
-        AMF0.encode(.string("publish"), into: &amf)
-        currentTransactionId += 1
-        AMF0.encode(.number(0.0), into: &amf)
-        AMF0.encode(.null, into: &amf)
-        AMF0.encode(.string(streamKey), into: &amf)
-        AMF0.encode(.string("live"), into: &amf)
-
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 3,
-            typeId: 20,
-            streamId: messageStreamId,
-            timestamp: 0,
-            payload: amf,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-
-        sendMetaData()
-
-        self.hasPublished = true
-        self.status = .streaming
-
-        // Send cached sequence headers if already available
-        if let avcHeader = cachedAVCSequenceHeader {
-            sendVideoData(avcHeader, timestampMs: 0)
-        }
-        if let aacHeader = cachedAACSequenceHeader {
-            sendAudioData(aacHeader, timestampMs: 0)
-        }
-    }
-
-    private func sendMetaData() {
-        var amf = Data()
-        AMF0.encode(.string("@setDataFrame"), into: &amf)
-        AMF0.encode(.string("onMetaData"), into: &amf)
-
-        let metaObj: [String: AMF0Value] = [
-            "duration": .number(0),
-            "width": .number(Double(videoWidth)),
-            "height": .number(Double(videoHeight)),
-            "videocodecid": .number(7.0), // AVC
-            "videodatarate": .number(Double(videoBitrate) / 1000.0),
-            "framerate": .number(Double(fps)),
-            "audiocodecid": .number(10.0), // AAC
-            "audiodatarate": .number(Double(audioBitrate) / 1000.0),
-            "audiosamplerate": .number(44100.0),
-            "audiosamplesize": .number(16.0),
-            "stereo": .boolean(true)
-        ]
-        AMF0.encode(.ecmaArray(metaObj), into: &amf)
-
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 4,
-            typeId: 18, // AMF0 Data
-            streamId: messageStreamId,
-            timestamp: 0,
-            payload: amf,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-    }
-
-    // MARK: - Media Ingestion
-    public func setAVCSequenceHeader(sps: Data, pps: Data) {
-        let tag = FLVTag.makeAVCSequenceHeader(sps: sps, pps: pps)
-        self.cachedAVCSequenceHeader = tag
-        if hasPublished {
-            sendVideoData(tag, timestampMs: 0)
-        }
-    }
-
-    public func setAACSequenceHeader(config: Data) {
-        let tag = FLVTag.makeAACSequenceHeader(config: config)
-        self.cachedAACSequenceHeader = tag
-        if hasPublished {
-            sendAudioData(tag, timestampMs: 0)
-        }
-    }
-
-    public func sendVideoSample(nalu: Data, pts: CMTime, isKeyFrame: Bool) {
-        guard hasPublished else { return }
-
-        if !startTime.isValid {
-            startTime = pts
-        }
-
-        let elapsedSeconds = CMTimeGetSeconds(CMTimeSubtract(pts, startTime))
-        let timestampMs = UInt32(max(0.0, elapsedSeconds) * 1000.0)
-
-        let flvPacket = FLVTag.makeAVCPacket(naluData: nalu, isKeyFrame: isKeyFrame, compositionTimeMs: 0)
-        sendVideoData(flvPacket, timestampMs: timestampMs)
-    }
-
-    public func sendAudioSample(aacData: Data, pts: CMTime) {
-        guard hasPublished else { return }
-
-        if !startTime.isValid {
-            startTime = pts
-        }
-
-        let elapsedSeconds = CMTimeGetSeconds(CMTimeSubtract(pts, startTime))
-        let timestampMs = UInt32(max(0.0, elapsedSeconds) * 1000.0)
-
-        let flvPacket = FLVTag.makeAACPacket(aacData: aacData)
-        sendAudioData(flvPacket, timestampMs: timestampMs)
-    }
-
-    private func sendVideoData(_ payload: Data, timestampMs: UInt32) {
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 6,
-            typeId: 9, // Video Message
-            streamId: messageStreamId,
-            timestamp: timestampMs,
-            payload: payload,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-    }
-
-    private func sendAudioData(_ payload: Data, timestampMs: UInt32) {
-        let chunk = RTMPChunker.chunkMessage(
-            csid: 4,
-            typeId: 8, // Audio Message
-            streamId: messageStreamId,
-            timestamp: timestampMs,
-            payload: payload,
-            chunkSize: chunkSize
-        )
-        sendRaw(chunk)
-    }
-
-    // MARK: - Incoming Message Loop
-    private func listenForServerMessages() {
-        guard let conn = connection else { return }
-
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] content, _, isComplete, error in
-            guard let self = self else { return }
-
-            if let data = content, !data.isEmpty {
-                self.parseIncomingRTMPData(data)
-            }
-
-            if isComplete {
-                self.disconnect()
-            } else if error == nil {
-                self.listenForServerMessages()
-            }
-        }
-    }
-
-    private func parseIncomingRTMPData(_ data: Data) {
-        // Inspect for _result, onStatus, NetStream.Publish.Start
-        var offset = 0
-        while offset < data.count {
-            if let str = AMF0.decode(data: data, offset: &offset) {
-                if case .string(let cmdName) = str {
-                    if cmdName == "_result" {
-                        // Response to createStream or connect
-                        if !self.hasPublished {
-                            self.sendPublish()
-                        }
-                    } else if cmdName == "onStatus" {
-                        // Stream status
-                        if !self.hasPublished {
-                            self.sendPublish()
-                        }
-                    }
-                }
-            } else {
-                offset += 1
-            }
-        }
-    }
-
-    // MARK: - Raw Network Helpers
-    private func sendRaw(_ data: Data) {
-        guard let conn = connection else {
-            droppedFramesCount += 1
+        guard let configuration, configuration.autoReconnect,
+              reconnectAttempts < configuration.maxReconnectAttempts else {
+            fail(reason)
             return
         }
 
-        conn.send(content: data, completion: .contentProcessed { [weak self] error in
-            if let error = error {
-                print("RTMP send error: \(error)")
-                self?.droppedFramesCount += 1
+        reconnectAttempts += 1
+        setStatus(.reconnecting)
+        let delay = configuration.reconnectDelay
+        let seconds = Double(delay.components.seconds) + Double(delay.components.attoseconds) / 1e18
+        queue.asyncAfter(deadline: .now() + seconds * Double(reconnectAttempts)) { [weak self] in
+            guard let self, !self.userRequestedStop else { return }
+            self.openConnection()
+        }
+    }
+
+    private func fail(_ message: String) {
+        closeConnection(sendingUnpublish: false)
+        statsTimer?.cancel()
+        statsTimer = nil
+        setStatus(.error(message))
+    }
+
+    private func setStatus(_ status: StreamStatus) {
+        onEvent?(.status(status))
+    }
+
+    // MARK: - Handshake (RTMP spec §5.2)
+
+    private func startHandshake() {
+        var c0c1 = Data([0x03])
+        c0c1.append(contentsOf: [UInt8](repeating: 0, count: 8)) // time + zero
+        var random = [UInt8](repeating: 0, count: 1528)
+        for index in random.indices {
+            random[index] = UInt8.random(in: .min ... .max)
+        }
+        c0c1.append(contentsOf: random)
+        sendRaw(c0c1)
+        receiveLoop(generation: generation)
+    }
+
+    private func receiveLoop(generation: Int) {
+        connection?.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] content, _, isComplete, error in
+            guard let self, generation == self.generation else { return }
+            if let content, !content.isEmpty {
+                self.handleIncoming(content)
+            }
+            if let error {
+                self.connectionLost("Connection error: \(error.localizedDescription)")
+            } else if isComplete {
+                self.connectionLost("Server closed the connection")
             } else {
-                self?.totalBytesSent += UInt64(data.count)
+                self.receiveLoop(generation: generation)
+            }
+        }
+    }
+
+    private func handleIncoming(_ data: Data) {
+        bytesReceived += UInt64(data.count)
+        sendAcknowledgementIfNeeded()
+
+        guard phase != .handshaking else {
+            handshakeBuffer.append(data)
+            // S0 (1) + S1 (1536) + S2 (1536)
+            guard handshakeBuffer.count >= 3073 else { return }
+            guard handshakeBuffer[handshakeBuffer.startIndex] == 0x03 else {
+                fail("Unsupported RTMP server version")
+                return
+            }
+            let s1 = handshakeBuffer.subdata(in: 1..<1537)
+            let leftover = handshakeBuffer.count > 3073 ? handshakeBuffer.subdata(in: 3073..<handshakeBuffer.count) : Data()
+            handshakeBuffer = Data()
+            sendRaw(s1) // C2 echoes S1
+            beginSession()
+            if !leftover.isEmpty {
+                handleMessages(reader.append(leftover))
+            }
+            return
+        }
+
+        handleMessages(reader.append(data))
+    }
+
+    // MARK: - Commands
+
+    private func beginSession() {
+        guard let configuration else { return }
+        phase = .connecting
+
+        var chunkSize = Data()
+        withUnsafeBytes(of: UInt32(outgoingChunkSize).bigEndian) { chunkSize.append(contentsOf: $0) }
+        sendMessage(type: .setChunkSize, csid: RTMPChunkStream.control, timestamp: 0, payload: chunkSize, chunkSizeOverride: 128)
+
+        connectTransactionID = takeTransactionID()
+        let endpoint = configuration.endpoint
+        let command: [AMF0Value] = [
+            .string("connect"),
+            .number(connectTransactionID),
+            .object([
+                AMF0Property("app", .string(endpoint.app)),
+                AMF0Property("type", .string("nonprivate")),
+                AMF0Property("flashVer", .string("FMLE/3.0 (compatible; Streamio)")),
+                AMF0Property("swfUrl", .string(endpoint.tcUrl)),
+                AMF0Property("tcUrl", .string(endpoint.tcUrl)),
+                // Enhanced RTMP capability advertisement (HEVC support).
+                AMF0Property("fourCcList", .strictArray([.string("avc1"), .string("hvc1")]))
+            ])
+        ]
+        sendCommand(command, streamID: 0)
+    }
+
+    private func handleMessages(_ messages: [RTMPMessage]) {
+        for message in messages {
+            switch message.type {
+            case .windowAckSize:
+                if let size = message.leadingUInt32 { serverWindowAckSize = size }
+            case .setPeerBandwidth:
+                if let size = message.leadingUInt32 {
+                    var payload = Data()
+                    withUnsafeBytes(of: size.bigEndian) { payload.append(contentsOf: $0) }
+                    sendMessage(type: .windowAckSize, csid: RTMPChunkStream.control, timestamp: 0, payload: payload)
+                }
+            case .userControl:
+                handleUserControl(message.payload)
+            case .commandAMF0:
+                handleCommand(AMF0.decodeAll(message.payload))
+            case .commandAMF3:
+                // AMF3 command messages carry a leading format byte, then AMF0 data.
+                handleCommand(AMF0.decodeAll(message.payload.dropFirst()))
+            default:
+                break
+            }
+        }
+    }
+
+    private func handleUserControl(_ payload: Data) {
+        guard payload.count >= 6 else { return }
+        let event = UInt16(payload[payload.startIndex]) << 8 | UInt16(payload[payload.startIndex + 1])
+        if event == 6 { // PingRequest → PingResponse with the same timestamp
+            var response = Data([0x00, 0x07])
+            response.append(payload[(payload.startIndex + 2)..<(payload.startIndex + 6)])
+            sendMessage(type: .userControl, csid: RTMPChunkStream.control, timestamp: 0, payload: response)
+        }
+    }
+
+    private func handleCommand(_ values: [AMF0Value]) {
+        guard let name = values.first?.stringValue else { return }
+        let transactionID = values.count > 1 ? values[1].numberValue ?? 0 : 0
+
+        switch name {
+        case "_result":
+            if transactionID == connectTransactionID, phase == .connecting {
+                startPublishFlow()
+            } else if transactionID == createStreamTransactionID, phase == .creatingStream {
+                if values.count > 3, let id = values[3].numberValue {
+                    messageStreamID = UInt32(id)
+                }
+                sendPublish()
+            }
+
+        case "_error":
+            if transactionID == connectTransactionID || transactionID == createStreamTransactionID {
+                let description = values.dropFirst(2).compactMap { $0["description"]?.stringValue }.first
+                fail(description.map { "Server rejected the stream: \($0)" } ?? "Server rejected the connection")
+            }
+
+        case "onStatus":
+            let info = values.dropFirst(2).first { $0["code"] != nil }
+            let code = info?["code"]?.stringValue ?? ""
+            if code == "NetStream.Publish.Start" {
+                goLive()
+            } else if code.contains("BadName") || code.contains("Failed") || code.contains("Rejected") || code.contains("Unauthorized") {
+                let description = info?["description"]?.stringValue ?? code
+                fail("Publish refused: \(description)")
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func startPublishFlow() {
+        guard let configuration else { return }
+        let key = AMF0Value.string(configuration.streamKey)
+        sendCommand([.string("releaseStream"), .number(takeTransactionID()), .null, key], streamID: 0)
+        sendCommand([.string("FCPublish"), .number(takeTransactionID()), .null, key], streamID: 0)
+        createStreamTransactionID = takeTransactionID()
+        sendCommand([.string("createStream"), .number(createStreamTransactionID), .null], streamID: 0)
+        phase = .creatingStream
+    }
+
+    private func sendPublish() {
+        guard let configuration else { return }
+        phase = .publishing
+        sendCommand([.string("publish"), .number(0), .null, .string(configuration.streamKey), .string("live")],
+                    streamID: messageStreamID)
+
+        // Some ingest servers never send NetStream.Publish.Start; don't wait forever.
+        let currentGeneration = generation
+        queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.generation == currentGeneration, self.phase == .publishing else { return }
+            self.goLive()
+        }
+    }
+
+    private func goLive() {
+        guard phase == .publishing, let configuration else { return }
+        phase = .live
+        reconnectAttempts = 0
+
+        let metadata: [AMF0Value] = [
+            .string("@setDataFrame"),
+            .string("onMetaData"),
+            .ecmaArray([
+                AMF0Property("duration", .number(0)),
+                AMF0Property("width", .number(Double(configuration.width))),
+                AMF0Property("height", .number(Double(configuration.height))),
+                AMF0Property("videocodecid", .number(configuration.videoFormat.metadataCodecID)),
+                AMF0Property("videodatarate", .number(Double(configuration.videoBitrate) / 1000)),
+                AMF0Property("framerate", .number(Double(configuration.fps))),
+                AMF0Property("audiocodecid", .number(10)),
+                AMF0Property("audiodatarate", .number(Double(configuration.audioBitrate) / 1000)),
+                AMF0Property("audiosamplerate", .number(configuration.audioSampleRate)),
+                AMF0Property("audiosamplesize", .number(16)),
+                AMF0Property("stereo", .boolean(true)),
+                AMF0Property("encoder", .string("Streamio"))
+            ])
+        ]
+        sendMessage(type: .dataAMF0, csid: RTMPChunkStream.data, timestamp: 0, payload: AMF0.encode(metadata))
+
+        if let videoSequenceHeader {
+            sendMessage(type: .video, csid: RTMPChunkStream.video, timestamp: 0, payload: videoSequenceHeader)
+        }
+        if let audioSequenceHeader {
+            sendMessage(type: .audio, csid: RTMPChunkStream.audio, timestamp: 0, payload: audioSequenceHeader)
+        }
+        waitingForKeyFrame = true
+        onKeyFrameRequest?()
+        setStatus(.streaming)
+    }
+
+    private func sendUnpublish() {
+        guard let configuration else { return }
+        sendMessage(type: .video, csid: RTMPChunkStream.video, timestamp: lastVideoTimestamp,
+                    payload: FLVTag.videoEndOfSequence(format: configuration.videoFormat))
+        sendCommand([.string("FCUnpublish"), .number(takeTransactionID()), .null, .string(configuration.streamKey)], streamID: 0)
+        sendCommand([.string("deleteStream"), .number(takeTransactionID()), .null, .number(Double(messageStreamID))], streamID: 0)
+    }
+
+    private func takeTransactionID() -> Double {
+        defer { nextTransactionID += 1 }
+        return nextTransactionID
+    }
+
+    // MARK: - Sending
+
+    private func sendCommand(_ values: [AMF0Value], streamID: UInt32) {
+        sendMessage(type: .commandAMF0, csid: RTMPChunkStream.command, timestamp: 0, payload: AMF0.encode(values), streamID: streamID)
+    }
+
+    private func sendMessage(type: RTMPMessageType, csid: UInt32, timestamp: UInt32, payload: Data,
+                             streamID: UInt32? = nil, chunkSizeOverride: Int? = nil) {
+        let isMedia = type == .audio || type == .video || type == .dataAMF0
+        let chunk = RTMPChunker.chunkMessage(
+            csid: csid,
+            typeId: type.rawValue,
+            streamId: streamID ?? (isMedia ? messageStreamID : 0),
+            timestamp: timestamp,
+            payload: payload,
+            chunkSize: chunkSizeOverride ?? outgoingChunkSize
+        )
+        sendRaw(chunk)
+    }
+
+    private func sendRaw(_ data: Data) {
+        guard let connection else { return }
+        let count = data.count
+        let currentGeneration = generation
+        bytesInFlight += count
+        connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            guard let self, currentGeneration == self.generation else { return }
+            self.bytesInFlight -= count
+            if let error {
+                self.connectionLost("Send failed: \(error.localizedDescription)")
+            } else {
+                self.stats.bytesSent += UInt64(count)
             }
         })
     }
 
-    private func receiveExact(count: Int, completion: @escaping (Data?) -> Void) {
-        guard let conn = connection else {
-            completion(nil)
-            return
-        }
-
-        conn.receive(minimumIncompleteLength: count, maximumLength: count) { content, _, isComplete, error in
-            if let error = error {
-                print("RTMP receive error: \(error)")
-                completion(nil)
-            } else {
-                completion(content)
-            }
-        }
+    private func sendAcknowledgementIfNeeded() {
+        guard phase != .handshaking, bytesReceived - lastAcknowledged >= UInt64(serverWindowAckSize) else { return }
+        lastAcknowledged = bytesReceived
+        var payload = Data()
+        withUnsafeBytes(of: UInt32(truncatingIfNeeded: bytesReceived).bigEndian) { payload.append(contentsOf: $0) }
+        sendMessage(type: .acknowledgement, csid: RTMPChunkStream.control, timestamp: 0, payload: payload)
     }
+
+    /// Converts a host-clock time to a monotonic stream timestamp in milliseconds.
+    private func mediaTimestamp(for seconds: Double, last: inout UInt32) -> UInt32 {
+        if timeBase == nil { timeBase = seconds }
+        let elapsed = max(0, seconds - (timeBase ?? seconds))
+        let value = max(last, UInt32(min(elapsed * 1000, Double(UInt32.max))))
+        last = value
+        return value
+    }
+
+    // MARK: - Statistics
 
     private func startStatsTimer() {
-        DispatchQueue.main.async { [weak self] in
-            self?.statsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-                guard let self = self else { return }
-                let now = Date()
-                let interval = now.timeIntervalSince(self.lastStatsDate)
-                let bytesDiff = self.totalBytesSent - self.lastStatsBytes
-                let bitrateKbps = (Double(bytesDiff) * 8.0) / (interval * 1000.0)
-
-                self.lastStatsDate = now
-                self.lastStatsBytes = self.totalBytesSent
-
-                self.delegate?.rtmpClientDidUpdateStatistics(
-                    self,
-                    bytesSent: self.totalBytesSent,
-                    bitrateKbps: max(0.0, bitrateKbps),
-                    droppedFrames: self.droppedFramesCount
-                )
-            }
+        statsTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in
+            self?.publishStatistics()
         }
+        timer.resume()
+        statsTimer = timer
     }
 
-    public func disconnect() {
-        networkQueue.async { [weak self] in
-            self?.disconnectInternal()
-        }
-    }
-
-    private func disconnectInternal() {
-        statsTimer?.invalidate()
-        statsTimer = nil
-        connection?.cancel()
-        connection = nil
-        hasPublished = false
-        status = .idle
+    private func publishStatistics() {
+        let now = ContinuousClock.now
+        let elapsed = now - lastStatsTime
+        let seconds = max(0.001, Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18)
+        let delta = stats.bytesSent - lastStatsBytes
+        stats.bitrateKbps = Double(delta) * 8 / seconds / 1000
+        stats.congestion = min(1, Double(bytesInFlight) / Double(dropThreshold))
+        lastStatsBytes = stats.bytesSent
+        lastStatsTime = now
+        onEvent?(.statistics(stats))
     }
 }
-

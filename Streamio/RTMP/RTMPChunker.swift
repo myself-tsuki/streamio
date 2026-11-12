@@ -2,11 +2,38 @@
 //  RTMPChunker.swift
 //  Streamio
 //
+//  Splits outgoing RTMP messages into chunks (RTMP spec §5.3).
+//
 
 import Foundation
 
-public struct RTMPChunker {
-    /// Formats an RTMP message into chunk packets according to chunk size
+nonisolated public enum RTMPMessageType: UInt8, Sendable {
+    case setChunkSize = 1
+    case abort = 2
+    case acknowledgement = 3
+    case userControl = 4
+    case windowAckSize = 5
+    case setPeerBandwidth = 6
+    case audio = 8
+    case video = 9
+    case dataAMF3 = 15
+    case commandAMF3 = 17
+    case dataAMF0 = 18
+    case commandAMF0 = 20
+}
+
+/// Chunk stream IDs used for outgoing traffic.
+nonisolated public enum RTMPChunkStream {
+    public static let control: UInt32 = 2
+    public static let command: UInt32 = 3
+    public static let audio: UInt32 = 4
+    public static let data: UInt32 = 5
+    public static let video: UInt32 = 6
+}
+
+nonisolated public enum RTMPChunker {
+    /// Formats an RTMP message into chunk packets according to `chunkSize`.
+    /// The first chunk carries a type-0 header; continuation chunks use type 3.
     public static func chunkMessage(
         csid: UInt32,
         typeId: UInt8,
@@ -15,79 +42,58 @@ public struct RTMPChunker {
         payload: Data,
         chunkSize: Int
     ) -> Data {
-        var result = Data()
         let totalLength = payload.count
+        let hasExtendedTimestamp = timestamp >= 0x00FF_FFFF
+        let timestampField: UInt32 = hasExtendedTimestamp ? 0x00FF_FFFF : timestamp
+        let continuationCount = max(0, (totalLength - 1) / max(chunkSize, 1))
 
-        // 1. Basic header for first chunk (Type 0: fmt = 0)
-        let basicHeader = makeBasicHeader(fmt: 0, csid: csid)
-        result.append(basicHeader)
+        var result = Data()
+        result.reserveCapacity(totalLength + 18 + continuationCount * (hasExtendedTimestamp ? 7 : 3))
 
-        // 2. Message header Type 0 (11 bytes)
-        let hasExtendedTimestamp = timestamp >= 0x00FFFFFF
-        let tsField: UInt32 = hasExtendedTimestamp ? 0x00FFFFFF : timestamp
-
-        // Timestamp (3 bytes, big endian)
-        result.append(UInt8((tsField >> 16) & 0xFF))
-        result.append(UInt8((tsField >> 8) & 0xFF))
-        result.append(UInt8(tsField & 0xFF))
-
-        // Message length (3 bytes, big endian)
-        result.append(UInt8((totalLength >> 16) & 0xFF))
-        result.append(UInt8((totalLength >> 8) & 0xFF))
-        result.append(UInt8(totalLength & 0xFF))
-
-        // Message type ID (1 byte)
+        result.append(basicHeader(fmt: 0, csid: csid))
+        appendUInt24(timestampField, to: &result)
+        appendUInt24(UInt32(totalLength), to: &result)
         result.append(typeId)
-
-        // Message Stream ID (4 bytes, little endian!)
-        var streamIdLE = streamId.littleEndian
-        result.append(Data(bytes: &streamIdLE, count: 4))
-
-        // Extended timestamp if needed
+        // Message stream ID is the only little-endian field in the protocol.
+        withUnsafeBytes(of: streamId.littleEndian) { result.append(contentsOf: $0) }
         if hasExtendedTimestamp {
-            var extTs = timestamp.bigEndian
-            result.append(Data(bytes: &extTs, count: 4))
+            withUnsafeBytes(of: timestamp.bigEndian) { result.append(contentsOf: $0) }
         }
 
-        // First chunk data
-        let firstChunkSize = min(totalLength, chunkSize)
-        result.append(payload.subdata(in: 0..<firstChunkSize))
+        var offset = payload.startIndex
+        let end = payload.endIndex
+        let firstEnd = min(end, offset + chunkSize)
+        result.append(payload[offset..<firstEnd])
+        offset = firstEnd
 
-        // Subsequent chunks (Type 3: fmt = 3)
-        var offset = firstChunkSize
-        let type3Header = makeBasicHeader(fmt: 3, csid: csid)
-
-        while offset < totalLength {
-            result.append(type3Header)
+        let continuationHeader = basicHeader(fmt: 3, csid: csid)
+        while offset < end {
+            result.append(continuationHeader)
             if hasExtendedTimestamp {
-                var extTs = timestamp.bigEndian
-                result.append(Data(bytes: &extTs, count: 4))
+                withUnsafeBytes(of: timestamp.bigEndian) { result.append(contentsOf: $0) }
             }
-            let nextSize = min(totalLength - offset, chunkSize)
-            result.append(payload.subdata(in: offset..<(offset + nextSize)))
-            offset += nextSize
+            let nextEnd = min(end, offset + chunkSize)
+            result.append(payload[offset..<nextEnd])
+            offset = nextEnd
         }
 
         return result
     }
 
-    private static func makeBasicHeader(fmt: UInt8, csid: UInt32) -> Data {
-        var header = Data()
-        if csid < 64 {
-            let b0 = (fmt << 6) | UInt8(csid)
-            header.append(b0)
+    static func basicHeader(fmt: UInt8, csid: UInt32) -> Data {
+        if csid >= 2 && csid < 64 {
+            return Data([(fmt << 6) | UInt8(csid)])
         } else if csid < 320 {
-            let b0 = (fmt << 6)
-            let b1 = UInt8(csid - 64)
-            header.append(contentsOf: [b0, b1])
+            return Data([fmt << 6, UInt8(csid - 64)])
         } else {
-            let b0 = (fmt << 6) | 1
-            let csidVal = csid - 64
-            let b1 = UInt8(csidVal & 0xFF)
-            let b2 = UInt8((csidVal >> 8) & 0xFF)
-            header.append(contentsOf: [b0, b1, b2])
+            let value = csid - 64
+            return Data([(fmt << 6) | 1, UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF)])
         }
-        return header
+    }
+
+    private static func appendUInt24(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8((value >> 16) & 0xFF))
+        data.append(UInt8((value >> 8) & 0xFF))
+        data.append(UInt8(value & 0xFF))
     }
 }
-
