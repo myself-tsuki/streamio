@@ -24,15 +24,25 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
     public struct ChannelSettings: Equatable, Sendable {
         public var gain: Float = 1
         public var isMuted = false
+        /// -1 (left) … 1 (right)
+        public var balance: Float = 0
+        public var isMono = false
+        public var monitoring: MonitoringMode = .off
 
-        public init(gain: Float = 1, isMuted: Bool = false) {
+        public init(gain: Float = 1, isMuted: Bool = false, balance: Float = 0, isMono: Bool = false,
+                    monitoring: MonitoringMode = .off) {
             self.gain = gain
             self.isMuted = isMuted
+            self.balance = balance
+            self.isMono = isMono
+            self.monitoring = monitoring
         }
     }
 
     /// Mixed output on the delivering source's queue. Time is host-clock seconds.
     public var onMixedAudio: (@Sendable (AVAudioPCMBuffer, Double) -> Void)?
+    /// Receives post-fader audio of channels whose monitoring is on.
+    public var monitor: AudioMonitor?
     /// Post-fader meter readings, at most `meterRate` times per second.
     public var onLevels: (@Sendable ([AudioChannelID: AudioLevels]) -> Void)?
 
@@ -96,15 +106,28 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         let frames = Int(stereo.frameLength)
         guard frames > 0 else { return }
 
-        // Fader
+        // Fader: mono downmix, balance, gain (up to +20 dB) and mute.
         let channelSettings = settings[channel] ?? ChannelSettings()
-        var gain = channelSettings.isMuted ? 0 : channelSettings.gain
-        vDSP_vsmul(left, 1, &gain, left, 1, vDSP_Length(frames))
-        vDSP_vsmul(right, 1, &gain, right, 1, vDSP_Length(frames))
+        if channelSettings.isMono {
+            var half: Float = 0.5
+            vDSP_vasm(left, 1, right, 1, &half, left, 1, vDSP_Length(frames))
+            memcpy(right, left, frames * MemoryLayout<Float>.size)
+        }
+        let gain = channelSettings.isMuted ? 0 : channelSettings.gain
+        let balance = max(-1, min(1, channelSettings.balance))
+        var leftGain = gain * (balance > 0 ? 1 - balance : 1)
+        var rightGain = gain * (balance < 0 ? 1 + balance : 1)
+        vDSP_vsmul(left, 1, &leftGain, left, 1, vDSP_Length(frames))
+        vDSP_vsmul(right, 1, &rightGain, right, 1, vDSP_Length(frames))
 
         accumulateMeter(channel: channel, left: left, right: right, frames: frames)
-        rings[channel]?.write(left: UnsafeBufferPointer(start: left, count: frames),
-                              right: UnsafeBufferPointer(start: right, count: frames))
+        if channelSettings.monitoring.isMonitoring {
+            monitor?.write(channel, left: left, right: right, frames: frames)
+        }
+        if channelSettings.monitoring.feedsOutput {
+            rings[channel]?.write(left: UnsafeBufferPointer(start: left, count: frames),
+                                  right: UnsafeBufferPointer(start: right, count: frames))
+        }
         lastDelivery[channel] = time
 
         if channel == clockChannel(now: time) {
@@ -132,12 +155,12 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         let leftBuffer = UnsafeMutableBufferPointer(start: outLeft, count: frames)
         let rightBuffer = UnsafeMutableBufferPointer(start: outRight, count: frames)
         for channel in AudioChannelID.allCases {
-            guard var ring = rings[channel] else { continue }
-            if ring.availableFrames > frames + maxLatencyFrames {
-                ring.skip(ring.availableFrames - frames - maxLatencyFrames / 2)
+            // Mutate in place: copying a ring out of the dictionary would copy its storage.
+            guard let available = rings[channel]?.availableFrames else { continue }
+            if available > frames + maxLatencyFrames {
+                rings[channel]?.skip(available - frames - maxLatencyFrames / 2)
             }
-            ring.mix(into: leftBuffer, rightBuffer, count: frames, gain: 1)
-            rings[channel] = ring
+            rings[channel]?.mix(into: leftBuffer, rightBuffer, count: frames, gain: 1)
         }
 
         // Soft safety clip so summed channels never wrap.

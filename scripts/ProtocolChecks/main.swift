@@ -19,4 +19,34 @@ var l = [Float](repeating: 0, count: 4), r = l
 l.withUnsafeMutableBufferPointer { lp in r.withUnsafeMutableBufferPointer { rp in _ = ring.mix(into: lp, rp, count: 4, gain: 1) } }
 precondition(l == [3,4,5,6], "ring \(l)")
 precondition(AudioLevels.decibels(fromAmplitude: 1) == 0 && AudioLevels.amplitude(fromDecibels: -60) == 0, "levels")
+
+// Canvas placement: fill crops the long side, PiP keeps aspect and sits inside the margin.
+let fill = CanvasPlacement.make(layout: .fill, pipScale: 0.3, contentWidth: 1440, contentHeight: 1080, canvasWidth: 1920, canvasHeight: 1080)
+precondition(fill.width == 1920 && abs(fill.cropHeight - 0.75) < 0.0001 && abs(fill.cropY - 0.125) < 0.0001 && fill.cropWidth == 1, "fill \(fill)")
+let fit = CanvasPlacement.make(layout: .fit, pipScale: 0.3, contentWidth: 1440, contentHeight: 1080, canvasWidth: 1920, canvasHeight: 1080)
+precondition(fit.width == 1440 && fit.x == 240 && fit.height == 1080, "fit \(fit)")
+let pip = CanvasPlacement.make(layout: .bottomRight, pipScale: 0.25, contentWidth: 1280, contentHeight: 720, canvasWidth: 1920, canvasHeight: 1080)
+precondition(pip.width == 480 && pip.height == 270 && pip.x + pip.width == 1920 - 48 && pip.y + pip.height == 1080 - 48, "pip \(pip)")
+let tall = CanvasPlacement.make(layout: .topLeft, pipScale: 0.3, contentWidth: 1080, contentHeight: 1920, canvasWidth: 1920, canvasHeight: 1080)
+precondition(tall.height <= 1080 * 0.54 + 0.001 && tall.x == 48 && tall.y == 48, "tall \(tall)")
+
+// Scenes start empty and round-trip through JSON with their sources.
+var scene = StudioScene(name: "Main")
+precondition(scene.sources.isEmpty && scene.cameraSource == nil, "empty scene")
+scene.sources = [SceneSource(name: "Cam", input: .camera(id: "usb-1"), layout: .bottomRight),
+                 SceneSource(name: "Screen", input: .display(id: 2)),
+                 SceneSource(name: "Logo", input: .image(path: "/tmp/logo.png"), opacity: 0.8)]
+let decoded = try! JSONDecoder().decode(StudioScene.self, from: try! JSONEncoder().encode(scene))
+precondition(decoded == scene && decoded.cameraSource?.input == .camera(id: "usb-1") && decoded.displaySource?.name == "Screen", "scene codable")
+
+// Monitoring modes and audio source defaults.
+precondition(!MonitoringMode.monitorOnly.feedsOutput && MonitoringMode.monitorOnly.isMonitoring, "monitor only")
+precondition(MonitoringMode.monitorAndOutput.feedsOutput && !MonitoringMode.off.isMonitoring, "monitor modes")
+let mic = AudioSourceConfig(channel: .microphone, deviceID: "usb-mic")
+precondition(mic.gainDecibels == 0 && !mic.isMuted && mic.monitoring == .off && mic.id == .microphone, "audio defaults")
+precondition(AudioLevels.amplitude(fromDecibels: 20) > 9.99 && AudioLevels.amplitude(fromDecibels: 20) < 10.01, "+20 dB")
+
+// Destinations get their own keychain account and default server.
+let facebook = StreamDestination(name: "Facebook", service: .facebook)
+precondition(facebook.serverURL.hasPrefix("rtmps://") && facebook.keychainAccount.hasPrefix("destination."), "destination")
 print("PROTOCOL_CHECKS_OK")

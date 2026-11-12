@@ -67,8 +67,14 @@ nonisolated public final class ScreenCaptureController: NSObject, SCStreamOutput
             throw CaptureError.permissionDenied
         }
 
-        let targetID = request.displayID ?? CGMainDisplayID()
-        guard let display = content.displays.first(where: { $0.displayID == targetID }) ?? content.displays.first else {
+        // A chosen display is used exactly; never silently swap in another screen.
+        let display: SCDisplay?
+        if let displayID = request.displayID {
+            display = content.displays.first { $0.displayID == displayID }
+        } else {
+            display = content.displays.first { $0.displayID == CGMainDisplayID() } ?? content.displays.first
+        }
+        guard let display else {
             throw CaptureError.displayUnavailable
         }
 

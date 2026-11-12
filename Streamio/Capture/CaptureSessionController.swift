@@ -27,6 +27,9 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
     private var videoInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
     private var runtimeErrorObserver: NSObjectProtocol?
+    /// Device + canvas the active format was chosen for. Re-locking a camera that is already
+    /// configured makes many USB webcams restart their stream, which shows as black blinks.
+    private var appliedFormatKey: String?
 
     public override init() {
         super.init()
@@ -74,6 +77,7 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
             if videoInput?.device != camera {
                 if let videoInput { session.removeInput(videoInput) }
                 videoInput = nil
+                appliedFormatKey = nil
                 if let camera {
                     do {
                         let input = try AVCaptureDeviceInput(device: camera)
@@ -87,7 +91,11 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
                 }
             }
             if let camera = videoInput?.device {
-                Self.applyBestFormat(to: camera, width: canvasWidth, height: canvasHeight, fps: fps)
+                let formatKey = "\(camera.uniqueID)|\(canvasWidth)x\(canvasHeight)@\(fps)"
+                if formatKey != appliedFormatKey {
+                    Self.applyBestFormat(to: camera, width: canvasWidth, height: canvasHeight, fps: fps)
+                    appliedFormatKey = formatKey
+                }
             }
 
             if audioInput?.device != microphone {

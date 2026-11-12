@@ -2,9 +2,17 @@
 //  MediaPipeline.swift
 //  Streamio
 //
-//  Wires capture → canvas compositor → preview / encoder → RTMP + recorder,
-//  and microphone + desktop audio → mixer → AAC → RTMP + recorder.
+//  Wires capture → canvas compositor → preview / encoder → RTMP outputs + recorder,
+//  and microphone + desktop audio → mixer → AAC → RTMP outputs + recorder (+ monitoring).
 //  Runs entirely off the main actor; the UI talks to it through `StudioController`.
+//
+//  Video is clock-driven, like OBS: sources only drop their newest frame into a slot, and a
+//  timer at the canvas frame rate composes whatever is current. A late or slow USB camera
+//  therefore repeats its last frame instead of flashing black, and the encoder always gets
+//  evenly spaced, monotonic timestamps.
+//
+//  One video encoder and one audio encoder feed every RTMP destination and the recorder,
+//  so streaming to several services at once never encodes twice.
 //
 
 import AVFoundation
@@ -12,21 +20,43 @@ import CoreMedia
 import Foundation
 
 nonisolated final class MediaPipeline: @unchecked Sendable {
+    /// Which capture slot a layer reads from.
+    enum Input: Hashable, Sendable {
+        case camera
+        case display
+        case image(String)
+    }
+
+    struct Layer: Equatable, Sendable {
+        var input: Input
+        var layout: SourceLayout
+        var pipScale: Double
+        var isMirrored: Bool
+        var opacity: Float
+        var filter: FilterType
+        var params: FilterParameters
+    }
+
     struct VideoState: Equatable, Sendable {
         var canvasWidth = 1920
         var canvasHeight = 1080
         var fps = 30
-        var filter: FilterType = .passthrough
-        var params = FilterParameters()
-        var isVisible = true
-        var hasSource = false
+        /// Visible layers, bottom first.
+        var layers: [Layer] = []
+    }
+
+    struct FrameReport: Sendable {
+        var outputFPS: Double
+        var cameraFPS: Double
+        var skippedFrames: Int
+        var renderMilliseconds: Double
     }
 
     enum Event: Sendable {
-        case stream(StreamStatus)
-        case network(RTMPClient.Statistics)
+        case stream(UUID, StreamStatus)
+        case network(UUID, RTMPClient.Statistics)
         case recording(StreamRecorder.Event)
-        case frames(fps: Double, skipped: Int)
+        case frames(FrameReport)
         case levels([AudioChannelID: AudioLevels])
         case captureError(String)
     }
@@ -35,62 +65,98 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
 
     let preview = PreviewFrameStore()
     let mixer = AudioMixer()
+    let monitor: AudioMonitor
     let camera = CaptureSessionController()
     let screen = ScreenCaptureController()
     private let videoEncoder = VideoEncoder()
     private let audioEncoder: AudioEncoder
-    private let rtmp = RTMPClient()
     private let recorder = StreamRecorder()
+
+    private struct SourceFrame {
+        var buffer: CVPixelBuffer
+        var arrival: Double
+    }
 
     private let lock = NSLock()
     private var video = VideoState()
-    private var isStreaming = false
+    private var clients: [UUID: RTMPClient] = [:]
     private var isRecording = false
-    private var lastSourceFrameTime: Double = 0
-    private var framesThisSecond = 0
-    private var fpsWindowStart: Double = 0
+    private var frames: [Input: SourceFrame] = [:]
+    private var images: [String: CVPixelBuffer] = [:]
+    private var loadingImages: Set<String> = []
+    private var videoSequenceHeader: Data?
+    private var audioSequenceHeader: Data?
+
+    // Statistics (guarded by `lock`)
+    private var renderedThisWindow = 0
+    private var cameraFramesThisWindow = 0
+    private var renderTimeThisWindow: Double = 0
+    private var windowStart: Double = 0
+
+    /// A source that stops delivering keeps its last frame on screen this long (OBS behaviour),
+    /// then its layer is dropped so an unplugged camera does not freeze the picture forever.
+    private let holdLastFrameSeconds: Double = 5
 
     private let clockQueue = DispatchQueue(label: "com.streamio.canvas.clock", qos: .userInteractive)
+    private let imageQueue = DispatchQueue(label: "com.streamio.canvas.images", qos: .utility)
     private var clock: DispatchSourceTimer?
+    private var clockFPS = 0
 
     init() {
         audioEncoder = AudioEncoder(inputFormat: mixer.outputFormat)
+        monitor = AudioMonitor(format: mixer.outputFormat)
+        mixer.monitor = monitor
+        monitor.onError = { [weak self] message in self?.onEvent?(.captureError(message)) }
 
-        camera.onVideo = { [weak self] sample in self?.ingestVideo(sample) }
+        camera.onVideo = { [weak self] sample in self?.ingestVideo(sample, into: .camera) }
         camera.onAudio = { [weak self] sample in self?.mixer.ingest(sample, from: .microphone) }
         camera.onError = { [weak self] message in self?.onEvent?(.captureError(message)) }
-        screen.onVideo = { [weak self] sample in self?.ingestVideo(sample) }
+        screen.onVideo = { [weak self] sample in self?.ingestVideo(sample, into: .display) }
         screen.onAudio = { [weak self] sample in self?.mixer.ingest(sample, from: .desktop) }
         screen.onStop = { [weak self] message in
             self?.mixer.reset(.desktop)
+            self?.clearFrame(.display)
             if let message { self?.onEvent?(.captureError(message)) }
         }
 
         mixer.onLevels = { [weak self] levels in self?.onEvent?(.levels(levels)) }
         mixer.onMixedAudio = { [weak self] buffer, time in
             guard let self else { return }
-            let (streaming, recording) = lock.withLock { (isStreaming, isRecording) }
+            let (streaming, recording) = lock.withLock { (!clients.isEmpty, isRecording) }
             if streaming { audioEncoder.encode(buffer, time: time) }
             if recording { recorder.appendAudio(buffer, time: time) }
         }
 
-        videoEncoder.onFormat = { [weak self] record, _ in self?.rtmp.setVideoSequenceHeader(record) }
+        videoEncoder.onFormat = { [weak self] record, _ in
+            guard let self else { return }
+            let targets = lock.withLock {
+                videoSequenceHeader = record
+                return Array(clients.values)
+            }
+            for client in targets { client.setVideoSequenceHeader(record) }
+        }
         videoEncoder.onFrame = { [weak self] frame in
             guard let self else { return }
-            let (streaming, recording) = lock.withLock { (isStreaming, isRecording) }
-            if streaming { rtmp.sendVideo(accessUnit: frame.accessUnit, pts: frame.pts, dts: frame.dts, isKeyFrame: frame.isKeyFrame) }
+            let (targets, recording) = lock.withLock { (Array(clients.values), isRecording) }
+            for client in targets {
+                client.sendVideo(accessUnit: frame.accessUnit, pts: frame.pts, dts: frame.dts, isKeyFrame: frame.isKeyFrame)
+            }
             if recording { recorder.appendVideo(frame) }
         }
-        audioEncoder.onConfig = { [weak self] config in self?.rtmp.setAudioSequenceHeader(config) }
-        audioEncoder.onPacket = { [weak self] packet, pts in self?.rtmp.sendAudio(aacPacket: packet, pts: pts) }
-
-        rtmp.onKeyFrameRequest = { [weak self] in self?.videoEncoder.requestKeyFrame() }
-        rtmp.onEvent = { [weak self] event in
-            switch event {
-            case .status(let status): self?.onEvent?(.stream(status))
-            case .statistics(let stats): self?.onEvent?(.network(stats))
+        audioEncoder.onConfig = { [weak self] config in
+            guard let self else { return }
+            let targets = lock.withLock {
+                audioSequenceHeader = config
+                return Array(clients.values)
             }
+            for client in targets { client.setAudioSequenceHeader(config) }
         }
+        audioEncoder.onPacket = { [weak self] packet, pts in
+            guard let self else { return }
+            let targets = lock.withLock { Array(clients.values) }
+            for client in targets { client.sendAudio(aacPacket: packet, pts: pts) }
+        }
+
         recorder.onEvent = { [weak self] event in
             guard let self else { return }
             if case .started = event {} else {
@@ -106,32 +172,98 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
     // MARK: - Configuration
 
     func updateVideo(_ state: VideoState) {
-        let fpsChanged = lock.withLock {
-            defer { video = state }
-            return video.fps != state.fps
+        let (fpsChanged, missingImages) = lock.withLock { () -> (Bool, [String]) in
+            let changed = video.fps != state.fps
+            video = state
+            var missing: [String] = []
+            for layer in state.layers {
+                if case .image(let path) = layer.input, images[path] == nil, !loadingImages.contains(path) {
+                    loadingImages.insert(path)
+                    missing.append(path)
+                }
+            }
+            return (changed, missing)
         }
+        for path in missingImages { loadImage(path) }
         if fpsChanged { startClock(fps: state.fps) }
     }
 
-    func setChannel(_ channel: AudioChannelID, gainDecibels: Float, muted: Bool) {
-        mixer.setSettings(.init(gain: AudioLevels.amplitude(fromDecibels: gainDecibels), isMuted: muted), for: channel)
+    func setChannel(_ channel: AudioChannelID, settings: AudioMixer.ChannelSettings) {
+        mixer.setSettings(settings, for: channel)
     }
 
-    // MARK: - Outputs
+    func resetChannel(_ channel: AudioChannelID) {
+        mixer.reset(channel)
+    }
 
-    func startStreaming(_ configuration: RTMPClient.Configuration, encoder: VideoEncoder.Settings, audioBitrate: AudioBitrate) throws {
+    /// Forget a slot's last frame (e.g. the scene switched to another camera).
+    func clearFrame(_ input: Input) {
+        lock.withLock { frames[input] = nil }
+    }
+
+    private func loadImage(_ path: String) {
+        imageQueue.async { [weak self] in
+            let buffer = MetalPipeline.makePixelBuffer(contentsOf: URL(fileURLWithPath: path))
+            guard let self else { return }
+            lock.withLock {
+                loadingImages.remove(path)
+                if let buffer { images[path] = buffer }
+            }
+            if buffer == nil {
+                onEvent?(.captureError(String(localized: "Streamio could not open the image at \(path).")))
+            }
+        }
+    }
+
+    // MARK: - Streaming (one encode, many destinations)
+
+    var hasActiveDestinations: Bool { lock.withLock { !clients.isEmpty } }
+
+    func startDestination(_ id: UUID, configuration: RTMPClient.Configuration,
+                          encoder: VideoEncoder.Settings, audioBitrate: AudioBitrate) throws {
         try ensureEncoder(encoder)
-        audioEncoder.start(bitrate: audioBitrate)
-        lock.withLock { isStreaming = true }
-        rtmp.connect(configuration)
+        if !audioEncoder.isRunning { audioEncoder.start(bitrate: audioBitrate) }
+
+        let client = RTMPClient()
+        client.onKeyFrameRequest = { [weak self] in self?.videoEncoder.requestKeyFrame() }
+        client.onEvent = { [weak self] event in
+            switch event {
+            case .status(let status): self?.onEvent?(.stream(id, status))
+            case .statistics(let stats): self?.onEvent?(.network(id, stats))
+            }
+        }
+        let (previous, videoHeader, audioHeader) = lock.withLock { () -> (RTMPClient?, Data?, Data?) in
+            let old = clients[id]
+            clients[id] = client
+            return (old, videoSequenceHeader, audioSequenceHeader)
+        }
+        previous?.disconnect()
+        client.connect(configuration)
+        // A destination joining a running encoder still needs the decoder configuration.
+        if let videoHeader { client.setVideoSequenceHeader(videoHeader) }
+        if let audioHeader { client.setAudioSequenceHeader(audioHeader) }
+        videoEncoder.requestKeyFrame()
     }
 
-    func stopStreaming() {
-        lock.withLock { isStreaming = false }
-        rtmp.disconnect()
-        audioEncoder.stop()
-        stopEncoderIfIdle()
+    func stopDestination(_ id: UUID) {
+        let (client, remaining) = lock.withLock { () -> (RTMPClient?, Int) in
+            let removed = clients.removeValue(forKey: id)
+            return (removed, clients.count)
+        }
+        client?.disconnect()
+        if remaining == 0 {
+            audioEncoder.stop()
+            lock.withLock { audioSequenceHeader = nil }
+            stopEncoderIfIdle()
+        }
     }
+
+    func stopAllDestinations() {
+        let ids = lock.withLock { Array(clients.keys) }
+        for id in ids { stopDestination(id) }
+    }
+
+    // MARK: - Recording
 
     func startRecording(_ settings: StreamRecorder.Settings, encoder: VideoEncoder.Settings) throws -> URL {
         try ensureEncoder(encoder)
@@ -151,73 +283,105 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
 
     private func ensureEncoder(_ settings: VideoEncoder.Settings) throws {
         if !videoEncoder.isRunning {
+            lock.withLock { videoSequenceHeader = nil }
             try videoEncoder.start(settings)
         }
     }
 
     private func stopEncoderIfIdle() {
-        let idle = lock.withLock { !isStreaming && !isRecording }
+        let idle = lock.withLock { clients.isEmpty && !isRecording }
         if idle { videoEncoder.stop() }
     }
 
     // MARK: - Video path
 
-    private func ingestVideo(_ sample: CMSampleBuffer) {
+    private static func hostSeconds() -> Double {
+        CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+    }
+
+    /// Sources only replace their slot. Arrival time (not the device timestamp) decides freshness,
+    /// because USB cameras often stamp frames 100–300 ms in the past.
+    private func ingestVideo(_ sample: CMSampleBuffer, into input: Input) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
-        let time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
-        let state = lock.withLock {
-            lastSourceFrameTime = time
-            return video
+        let now = Self.hostSeconds()
+        lock.withLock {
+            frames[input] = SourceFrame(buffer: pixelBuffer, arrival: now)
+            if input == .camera { cameraFramesThisWindow += 1 }
         }
-        guard state.isVisible, state.hasSource else { return }
-        render(source: pixelBuffer, state: state, pts: CMSampleBufferGetPresentationTimeStamp(sample))
     }
 
-    private func render(source: CVPixelBuffer?, state: VideoState, pts: CMTime) {
-        guard let canvas = MetalPipeline.shared.composeCanvas(
-            source: source, width: state.canvasWidth, height: state.canvasHeight,
-            filter: state.filter, params: state.params
-        ) else { return }
-        preview.publish(canvas)
-
-        let duration = CMTime(value: 1, timescale: CMTimeScale(state.fps))
-        if lock.withLock({ isStreaming || isRecording }) {
-            videoEncoder.encode(canvas, pts: pts, duration: duration)
-        }
-        countFrame(at: CMTimeGetSeconds(pts))
-    }
-
-    /// Emits black canvas frames when the source is hidden, missing or stalled,
-    /// so the stream never freezes (OBS always outputs video).
     private func startClock(fps: Int) {
         clock?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: clockQueue)
-        let interval = 1.0 / Double(max(fps, 1))
+        clockFPS = max(fps, 1)
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: clockQueue)
+        let interval = 1.0 / Double(clockFPS)
         timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(1))
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            let now = CMClockGetTime(CMClockGetHostTimeClock())
-            let (state, last) = lock.withLock { (video, lastSourceFrameTime) }
-            let stalled = CMTimeGetSeconds(now) - last > interval * 3
-            if !state.hasSource || !state.isVisible || stalled {
-                render(source: nil, state: state, pts: now)
-            }
-        }
+        timer.setEventHandler { [weak self] in self?.tick() }
         timer.resume()
         clock = timer
     }
 
-    private func countFrame(at time: Double) {
-        let report: (Double, Int)? = lock.withLock {
-            framesThisSecond += 1
-            if fpsWindowStart == 0 { fpsWindowStart = time }
-            let elapsed = time - fpsWindowStart
-            guard elapsed >= 1 else { return nil }
-            defer { framesThisSecond = 0; fpsWindowStart = time }
-            return (Double(framesThisSecond) / elapsed, 0)
+    private func tick() {
+        let started = Self.hostSeconds()
+        let pts = CMClockGetTime(CMClockGetHostTimeClock())
+        let (state, slots, stills, outputting) = lock.withLock {
+            (video, frames, images, !clients.isEmpty || isRecording)
         }
-        if let report {
-            onEvent?(.frames(fps: report.0, skipped: videoEncoder.skippedFrameCount))
+
+        var layers: [CanvasLayer] = []
+        layers.reserveCapacity(state.layers.count)
+        for layer in state.layers {
+            let buffer: CVPixelBuffer?
+            switch layer.input {
+            case .image(let path):
+                buffer = stills[path]
+            case .camera, .display:
+                if let frame = slots[layer.input], started - frame.arrival < holdLastFrameSeconds {
+                    buffer = frame.buffer
+                } else {
+                    buffer = nil
+                }
+            }
+            guard let buffer else { continue }
+            layers.append(CanvasLayer(source: buffer, layout: layer.layout, pipScale: layer.pipScale,
+                                      isMirrored: layer.isMirrored, opacity: layer.opacity,
+                                      filter: layer.filter, params: layer.params))
+        }
+
+        guard let canvas = MetalPipeline.shared.composeCanvas(
+            layers: layers, width: state.canvasWidth, height: state.canvasHeight
+        ) else { return }
+        preview.publish(canvas)
+
+        if outputting {
+            videoEncoder.encode(canvas, pts: pts, duration: CMTime(value: 1, timescale: CMTimeScale(max(state.fps, 1))))
+        }
+        report(renderSeconds: Self.hostSeconds() - started, now: started)
+    }
+
+    private func report(renderSeconds: Double, now: Double) {
+        let report: FrameReport? = lock.withLock {
+            renderedThisWindow += 1
+            renderTimeThisWindow += renderSeconds
+            if windowStart == 0 { windowStart = now }
+            let elapsed = now - windowStart
+            guard elapsed >= 1 else { return nil }
+            defer {
+                renderedThisWindow = 0
+                cameraFramesThisWindow = 0
+                renderTimeThisWindow = 0
+                windowStart = now
+            }
+            return FrameReport(
+                outputFPS: Double(renderedThisWindow) / elapsed,
+                cameraFPS: Double(cameraFramesThisWindow) / elapsed,
+                skippedFrames: 0,
+                renderMilliseconds: renderTimeThisWindow / Double(max(renderedThisWindow, 1)) * 1000
+            )
+        }
+        if var report {
+            report.skippedFrames = videoEncoder.skippedFrameCount
+            onEvent?(.frames(report))
         }
     }
 }

@@ -2,7 +2,7 @@
 //  SettingsView.swift
 //  Streamio
 //
-//  Settings (⌘,), organised like OBS: Stream, Output, Audio, Video, Advanced.
+//  Settings (⌘,), organised like OBS: Stream (multistream destinations), Output, Audio, Video, Advanced.
 //
 
 import SwiftUI
@@ -12,52 +12,144 @@ struct SettingsView: View {
         TabView {
             Tab("Stream", systemImage: "dot.radiowaves.left.and.right") { StreamSettingsPane() }
             Tab("Output", systemImage: "externaldrive") { OutputSettingsPane() }
+            Tab("Audio", systemImage: "speaker.wave.2") { AudioSettingsPane() }
             Tab("Video", systemImage: "display") { VideoSettingsPane() }
             Tab("Advanced", systemImage: "gearshape.2") { AdvancedSettingsPane() }
         }
-        .frame(width: 560, height: 460)
+        .frame(width: 620, height: 560)
     }
 }
 
+/// Multistream destinations. Every enabled destination gets the same encoded stream.
 struct StreamSettingsPane: View {
     @Environment(StudioController.self) private var studio
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Streamio encodes once and sends the same packets to every enabled destination, so streaming to YouTube and Facebook together costs no extra CPU or GPU.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(studio.destinations) { destination in
+                DestinationSettingsSection(destinationID: destination.id)
+            }
+            Section {
+                Menu {
+                    ForEach(StreamingService.allCases) { service in
+                        Button(service.title) { studio.addDestination(service) }
+                    }
+                } label: {
+                    Label("Add Destination", systemImage: "plus")
+                }
+                .fixedSize()
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct DestinationSettingsSection: View {
+    @Environment(StudioController.self) private var studio
+    let destinationID: UUID
     @State private var revealsKey = false
+
+    var body: some View {
+        if let current = studio.destinations.first(where: { $0.id == destinationID }) {
+            // Looked up by ID on every access, so removing a destination can never index past the end.
+            let destination = Binding<StreamDestination>(
+                get: { studio.destinations.first { $0.id == destinationID } ?? current },
+                set: { updated in
+                    if let index = studio.destinations.firstIndex(where: { $0.id == destinationID }) {
+                        studio.destinations[index] = updated
+                    }
+                }
+            )
+            let isActive = studio.status(of: destinationID).isActive
+            let key = Binding(get: { studio.streamKey(for: destinationID) },
+                              set: { studio.setStreamKey($0, for: destinationID) })
+            Section {
+                Toggle("Include When Going Live", isOn: destination.isEnabled)
+                TextField("Name", text: destination.name)
+                Picker("Service", selection: destination.service) {
+                    ForEach(StreamingService.allCases) { Text($0.title).tag($0) }
+                }
+                .onChange(of: destination.wrappedValue.service) { _, service in
+                    if let first = service.servers.first { destination.wrappedValue.serverURL = first.url }
+                }
+                if destination.wrappedValue.service.servers.isEmpty {
+                    TextField("Server", text: destination.serverURL, prompt: Text(verbatim: "rtmp://example.com/live"))
+                } else {
+                    Picker("Server", selection: destination.serverURL) {
+                        ForEach(destination.wrappedValue.service.servers) { Text($0.name).tag($0.url) }
+                    }
+                }
+                LabeledContent("Stream Key") {
+                    HStack {
+                        if revealsKey {
+                            TextField("Stream Key", text: key).labelsHidden()
+                        } else {
+                            SecureField("Stream Key", text: key).labelsHidden()
+                        }
+                        Button(revealsKey ? "Hide Key" : "Show Key", systemImage: revealsKey ? "eye.slash" : "eye") { revealsKey.toggle() }
+                            .labelStyle(.iconOnly)
+                            .help(revealsKey ? "Hide stream key" : "Show stream key")
+                    }
+                }
+                HStack {
+                    if let url = destination.wrappedValue.service.streamKeyHelpURL {
+                        Link("Get Stream Key", destination: url)
+                    }
+                    Spacer()
+                    Button("Remove Destination", role: .destructive) { studio.removeDestination(destinationID) }
+                }
+            } header: {
+                Text(destination.wrappedValue.name)
+            } footer: {
+                Text("Stream keys are stored in the macOS keychain.")
+            }
+            .disabled(isActive)
+        }
+    }
+}
+
+struct AudioSettingsPane: View {
+    @Environment(StudioController.self) private var studio
+    @State private var outputs: [AudioOutputDevice] = []
 
     var body: some View {
         @Bindable var studio = studio
         Form {
-            Picker("Service", selection: $studio.service) {
-                ForEach(StreamingService.allCases) { Text($0.title).tag($0) }
-            }
-            .onChange(of: studio.service) { _, service in
-                if let first = service.servers.first { studio.serverURL = first.url }
-            }
-            if studio.service.servers.isEmpty {
-                TextField("Server", text: $studio.serverURL, prompt: Text(verbatim: "rtmp://example.com/live"))
-            } else {
-                Picker("Server", selection: $studio.serverURL) {
-                    ForEach(studio.service.servers) { Text($0.name).tag($0.url) }
+            Section("Audio Sources") {
+                if studio.audioSources.isEmpty {
+                    Text("No audio sources yet. Add them from the Audio Mixer or the Sources “+” menu.")
+                        .foregroundStyle(.secondary)
                 }
-            }
-            LabeledContent("Stream Key") {
-                HStack {
-                    if revealsKey {
-                        TextField("Stream Key", text: $studio.streamKey).labelsHidden()
-                    } else {
-                        SecureField("Stream Key", text: $studio.streamKey).labelsHidden()
+                ForEach(studio.audioSources) { config in
+                    LabeledContent(studio.audioTitle(config.channel)) {
+                        Text(config.channel.title).foregroundStyle(.secondary)
                     }
-                    Button(revealsKey ? "Hide Key" : "Show Key", systemImage: revealsKey ? "eye.slash" : "eye") { revealsKey.toggle() }
-                        .labelStyle(.iconOnly)
                 }
+                AudioInputMenu()
+                    .fixedSize()
+                Button("Add Desktop Audio") { studio.addDesktopAudio() }
+                    .disabled(studio.audioSource(.desktop) != nil)
             }
-            if let url = studio.service.streamKeyHelpURL {
-                Link("Get Stream Key", destination: url)
+            Section("Monitoring") {
+                Picker("Monitoring Device", selection: $studio.monitorDeviceUID) {
+                    Text("System Default Output").tag("")
+                    ForEach(outputs) { Text($0.name).tag($0.id) }
+                    if !studio.monitorDeviceUID.isEmpty, !outputs.contains(where: { $0.id == studio.monitorDeviceUID }) {
+                        Text("Disconnected Output").tag(studio.monitorDeviceUID)
+                    }
+                }
+                Text("Turn monitoring on per source with the headphones button in the mixer.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
-            Text("Your stream key is stored in the macOS keychain.")
-                .font(.callout).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
-        .disabled(studio.streamStatus.isActive)
+        .onAppear { outputs = AudioOutputDevices.all() }
     }
 }
 

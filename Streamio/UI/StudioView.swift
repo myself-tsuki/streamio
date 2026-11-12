@@ -2,75 +2,164 @@
 //  StudioView.swift
 //  Streamio
 //
-//  Root window: program preview on top, OBS-style docks below, live status bar at the foot,
-//  scene properties in a native inspector. The window background is a behind-window blur,
-//  so the desktop shows through the glass.
+//  Root window, laid out like OBS Studio: scenes and sources in the left sidebar, the program
+//  preview on top with the audio mixer under it, broadcast controls, destinations and source
+//  properties on the right, and live stats along the foot. Fullscreen mode shows only the
+//  program output with the stats bar floating over it.
 //
 
 import SwiftUI
 
 struct StudioView: View {
     @Environment(StudioController.self) private var studio
-    @State private var showsInspector = true
+    @State private var showsSidebar = true
 
     var body: some View {
-        @Bindable var studio = studio
-        VStack(spacing: Theme.spacingM) {
-            PreviewPane()
-                .layoutPriority(1)
-            GlassEffectContainer(spacing: Theme.spacingM) {
-                HStack(spacing: Theme.spacingM) {
-                    ScenesDock()
-                    SourcesDock()
-                    AudioMixerDock()
-                        .frame(minWidth: 300)
-                    ControlsDock()
-                }
-                .frame(height: Theme.dockHeight)
-            }
-            StudioStatusBar()
-        }
-        .padding(Theme.spacingM)
-        .frame(minWidth: 1100, minHeight: 720)
-        .containerBackground(.ultraThinMaterial, for: .window)
-        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
-        .navigationTitle(studio.selectedScene?.name ?? "Streamio")
-        .inspector(isPresented: $showsInspector) {
-            SceneInspector()
-                .inspectorColumnWidth(min: 260, ideal: 300, max: 380)
-        }
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button("Scene Properties", systemImage: "sidebar.trailing") { showsInspector.toggle() }
+        Group {
+            if studio.isFullscreenPreview {
+                FullscreenProgramView()
+            } else {
+                studioLayout
             }
         }
+        .frame(minWidth: 1180, minHeight: 760)
         .alert("Streamio", isPresented: Binding(get: { studio.alertMessage != nil }, set: { if !$0 { studio.alertMessage = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(studio.alertMessage ?? "")
         }
     }
+
+    private var studioLayout: some View {
+        VStack(spacing: Theme.spacingM) {
+            GlassEffectContainer(spacing: Theme.spacingM) {
+                HStack(alignment: .top, spacing: Theme.spacingM) {
+                    if showsSidebar {
+                        VStack(spacing: Theme.spacingM) {
+                            ScenesDock()
+                            SourcesDock()
+                                .layoutPriority(1)
+                        }
+                        .frame(width: Theme.sidebarWidth)
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                    }
+
+                    VStack(spacing: Theme.spacingM) {
+                        PreviewPane()
+                            .layoutPriority(1)
+                        AudioMixerDock()
+                            .frame(height: Theme.mixerHeight)
+                    }
+                    .frame(minWidth: 560)
+
+                    VStack(spacing: Theme.spacingM) {
+                        ControlsDock()
+                            .fixedSize(horizontal: false, vertical: true)
+                        DestinationsDock()
+                            .fixedSize(horizontal: false, vertical: true)
+                        SourcePropertiesDock()
+                    }
+                    .frame(width: Theme.controlsWidth)
+                }
+            }
+            StudioStatusBar()
+        }
+        .padding(Theme.spacingM)
+        .containerBackground(.ultraThinMaterial, for: .window)
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .navigationTitle(studio.selectedScene?.name ?? "Streamio")
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button(showsSidebar ? "Hide Scenes and Sources" : "Show Scenes and Sources", systemImage: "sidebar.leading") {
+                    withAnimation(.smooth(duration: 0.25)) { showsSidebar.toggle() }
+                }
+                .help("Show or hide the Scenes and Sources sidebar")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button("Fullscreen Preview", systemImage: "arrow.up.left.and.arrow.down.right") {
+                    studio.setFullscreenPreview(true)
+                }
+                .help("Show only the program output, full screen (⇧⌘F)")
+            }
+        }
+    }
 }
+
+// MARK: - Program preview
 
 struct PreviewPane: View {
     @Environment(StudioController.self) private var studio
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            MetalPreviewView(store: studio.previewStore, fps: studio.frameRate.rawValue)
-                .aspectRatio(CGFloat(studio.resolution.width) / CGFloat(studio.resolution.height), contentMode: .fit)
-                .background(.black, in: .rect(cornerRadius: Theme.previewRadius))
-                .clipShape(.rect(cornerRadius: Theme.previewRadius))
-                .overlay {
-                    if studio.selectedScene?.videoSource == VideoSource.none {
-                        ContentUnavailableView("No Video Source", systemImage: "rectangle.dashed",
-                                               description: Text("Add a camera or display from the Sources dock."))
-                            .foregroundStyle(.white)
+        ProgramView(cornerRadius: Theme.previewRadius) { studio.setFullscreenPreview(true) }
+            .overlay {
+                if let scene = studio.selectedScene, !scene.sources.contains(where: \.isVisible) {
+                    VStack(spacing: Theme.spacingM) {
+                        ContentUnavailableView(
+                            scene.sources.isEmpty ? "This scene has no sources" : "Every source is hidden",
+                            systemImage: "rectangle.dashed",
+                            description: Text(scene.sources.isEmpty
+                                ? "Add a camera, display or image from the Sources dock in the sidebar."
+                                : "Show a source with its eye button in the Sources dock.")
+                        )
+                        if scene.sources.isEmpty {
+                            AddSourceMenu(showsTitle: true)
+                                .buttonStyle(.glass)
+                                .fixedSize()
+                        }
                     }
+                    .foregroundStyle(.white)
+                    .padding(Theme.spacingL)
                 }
-                .overlay(alignment: .topLeading) { OnAirBadges().padding(Theme.spacingM) }
+            }
+            .overlay(alignment: .topLeading) { OnAirBadges().padding(Theme.spacingM) }
+            .overlay(alignment: .bottomLeading) { SourceWarnings().padding(Theme.spacingM) }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// The program output, letterboxed at the canvas aspect ratio.
+struct ProgramView: View {
+    @Environment(StudioController.self) private var studio
+    var cornerRadius: CGFloat
+    var onDoubleClick: () -> Void
+
+    var body: some View {
+        MetalPreviewView(store: studio.previewStore, fps: studio.frameRate.rawValue)
+            .aspectRatio(CGFloat(studio.resolution.width) / CGFloat(studio.resolution.height), contentMode: .fit)
+            .background(.black, in: .rect(cornerRadius: cornerRadius))
+            .clipShape(.rect(cornerRadius: cornerRadius))
+            .overlay {
+                // The Metal view is AppKit; a SwiftUI layer on top catches the double-click.
+                Color.clear
+                    .contentShape(.rect)
+                    .onTapGesture(count: 2, perform: onDoubleClick)
+            }
+    }
+}
+
+/// Names any source whose device is unplugged. Streamio waits for that exact device
+/// instead of switching to another one.
+struct SourceWarnings: View {
+    @Environment(StudioController.self) private var studio
+
+    var body: some View {
+        let missing = (studio.selectedScene?.sources ?? []).filter { $0.isVisible && !studio.devices.isConnected($0.input) }
+        let micMissing = studio.isAudioDeviceMissing(.microphone)
+        if !missing.isEmpty || micMissing {
+            VStack(alignment: .leading, spacing: Theme.spacingXS) {
+                ForEach(missing) { source in
+                    Label("\(source.name) is disconnected. Waiting for this device.", systemImage: "exclamationmark.triangle.fill")
+                }
+                if micMissing {
+                    Label("\(studio.audioTitle(.microphone)) is disconnected. Waiting for this device.", systemImage: "mic.slash.fill")
+                }
+            }
+            .font(.callout)
+            .padding(.horizontal, Theme.spacingM)
+            .padding(.vertical, Theme.spacingS)
+            .glassEffect(.regular.tint(Theme.warning.opacity(0.35)), in: .rect(cornerRadius: Theme.rowRadius + 4))
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -96,81 +185,126 @@ struct OnAirBadges: View {
     }
 }
 
-struct StudioStatusBar: View {
+// MARK: - Fullscreen
+
+struct FullscreenProgramView: View {
     @Environment(StudioController.self) private var studio
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        @Bindable var studio = studio
+        ZStack {
+            Color.black.ignoresSafeArea()
+            ProgramView(cornerRadius: 0) { studio.setFullscreenPreview(false) }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+        }
+        .overlay(alignment: .topLeading) { OnAirBadges().padding(Theme.spacingL) }
+        .overlay(alignment: .topTrailing) {
+            HStack(spacing: Theme.spacingS) {
+                Button(studio.showsStatsOverlay ? "Hide Stats" : "Show Stats", systemImage: "chart.bar.xaxis") {
+                    studio.showsStatsOverlay.toggle()
+                }
+                .help("Show or hide the stats bar (I)")
+                Button("Exit Fullscreen", systemImage: "arrow.down.right.and.arrow.up.left") {
+                    studio.setFullscreenPreview(false)
+                }
+                .help("Exit fullscreen (Esc)")
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.glass)
+            .controlSize(.large)
+            .padding(Theme.spacingL)
+        }
+        .overlay(alignment: .bottom) {
+            if studio.showsStatsOverlay {
+                StatsBar(style: .overlay)
+                    .padding(Theme.spacingL)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: studio.showsStatsOverlay)
+        .environment(\.colorScheme, .dark)
+        .toolbar(.hidden, for: .windowToolbar)
+        .focusable()
+        .focusEffectDisabled()
+        .focused($isFocused)
+        .onAppear { isFocused = true }
+        .onExitCommand { studio.setFullscreenPreview(false) }
+        .onKeyPress("i") {
+            studio.showsStatsOverlay.toggle()
+            return .handled
+        }
+    }
+}
+
+// MARK: - Stats
+
+struct StudioStatusBar: View {
+    var body: some View {
+        StatsBar(style: .statusBar)
+    }
+}
+
+/// Live figures shown at the foot of the studio and over the fullscreen program:
+/// stream and recording timers, output and camera FPS, render time, CPU, GPU, memory,
+/// total and per-destination bitrate, dropped frames and free disk space.
+struct StatsBar: View {
+    enum Style { case statusBar, overlay }
+
+    @Environment(StudioController.self) private var studio
+    let style: Style
 
     var body: some View {
         let stats = studio.stats
         TimelineView(.periodic(from: .now, by: 1)) { context in
             HStack(spacing: Theme.spacingL) {
-                metric("Dropped", "\(stats.droppedFrames) (\(stats.droppedPercent, format: .number.precision(.fractionLength(1)))%)", "exclamationmark.triangle")
-                Divider()
                 metric(studio.streamStatus.isLive ? "LIVE" : studio.streamStatus.label,
                        Duration.clock(since: stats.streamStart, now: context.date), "dot.radiowaves.left.and.right")
                     .foregroundStyle(studio.streamStatus.isLive ? Theme.live : .primary)
                 metric("REC", Duration.clock(since: stats.recordStart, now: context.date), "record.circle")
                     .foregroundStyle(studio.isRecording ? Theme.live : .primary)
-                Spacer()
+                Divider().frame(height: 14)
+                metric("FPS", "\(stats.fps, format: .number.precision(.fractionLength(2))) / \(studio.frameRate.rawValue)", "film")
+                if studio.selectedScene?.cameraSource != nil {
+                    metric("Camera", "\(stats.cameraFPS, format: .number.precision(.fractionLength(1))) fps", "web.camera")
+                }
+                if style == .overlay {
+                    metric("Render", "\(stats.renderMilliseconds, format: .number.precision(.fractionLength(1))) ms", "timer")
+                }
+                Spacer(minLength: Theme.spacingS)
                 metric("CPU", "\(stats.cpuPercent, format: .number.precision(.fractionLength(1)))%", "cpu")
                 metric("GPU", stats.gpuPercent.map { "\(Int($0))%" } ?? "—", "rectangle.3.group")
                 metric("Memory", stats.memoryBytes.formatted(.byteCount(style: .memory)), "memorychip")
-                metric("FPS", "\(stats.fps, format: .number.precision(.fractionLength(2))) / \(studio.frameRate.rawValue)", "film")
+                Divider().frame(height: 14)
                 metric("Bitrate", "\(Int(stats.bitrateKbps)) kb/s", "speedometer")
-                    .foregroundStyle(stats.congestion > 0.5 ? Color.yellow : .primary)
+                    .foregroundStyle(stats.congestion > 0.5 ? Theme.warning : .primary)
+                if style == .overlay {
+                    ForEach(studio.destinations.filter { studio.status(of: $0.id).isActive }) { destination in
+                        metric(destination.name, "\(Int(stats.network[destination.id]?.bitrateKbps ?? 0)) kb/s",
+                               studio.status(of: destination.id).systemImage)
+                            .foregroundStyle(studio.status(of: destination.id).tint)
+                    }
+                }
+                metric("Dropped", "\(stats.droppedFrames) (\(stats.droppedPercent, format: .number.precision(.fractionLength(1)))%)",
+                       "exclamationmark.triangle")
+                if style == .overlay, let free = stats.diskFreeBytes {
+                    metric("Disk", "\(free.formatted(.byteCount(style: .file))) free", "internaldrive")
+                }
             }
-            .font(.callout.monospacedDigit())
+            .font(style == .overlay ? .body.monospacedDigit() : .callout.monospacedDigit())
             .lineLimit(1)
+            .minimumScaleFactor(0.75)
         }
         .padding(.horizontal, Theme.spacingL)
-        .padding(.vertical, Theme.spacingS)
+        .padding(.vertical, style == .overlay ? Theme.spacingM : Theme.spacingS)
         .glassEffect(.regular, in: .capsule)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Studio statistics")
     }
 
     private func metric(_ title: String, _ value: String, _ symbol: String) -> some View {
         Label { Text("\(title) \(value)") } icon: { Image(systemName: symbol) }
             .accessibilityElement(children: .combine)
-    }
-}
-
-struct SceneInspector: View {
-    @Environment(StudioController.self) private var studio
-
-    var body: some View {
-        @Bindable var studio = studio
-        if let scene = studio.selectedScene {
-            let binding = Binding<StudioScene>(get: { scene }, set: { studio.selectedScene = $0 })
-            Form {
-                Section("Scene") {
-                    TextField("Name", text: binding.name)
-                    Toggle("Show Video", isOn: binding.isVideoVisible)
-                }
-                Section("Filter") {
-                    Picker("Filter", selection: binding.filter) {
-                        ForEach(FilterType.allCases) { Label($0.title, systemImage: $0.systemImage).tag($0) }
-                    }
-                    adjustment("Intensity", binding.adjustments.intensity, 0...1, neutral: 1)
-                }
-                Section("Colour") {
-                    adjustment("Brightness", binding.adjustments.brightness, -0.5...0.5, neutral: 0)
-                    adjustment("Contrast", binding.adjustments.contrast, 0.5...2, neutral: 1)
-                    adjustment("Saturation", binding.adjustments.saturation, 0...2, neutral: 1)
-                    Button("Reset Adjustments") { binding.wrappedValue.adjustments = FilterParameters() }
-                }
-            }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
-        } else {
-            ContentUnavailableView("No Scene Selected", systemImage: "square.stack")
-        }
-    }
-
-    private func adjustment(_ title: LocalizedStringKey, _ value: Binding<Float>, _ range: ClosedRange<Float>, neutral: Float) -> some View {
-        LabeledContent(title) {
-            Slider(value: value, in: range) { Text(title) } ticks: {
-                SliderTick(value: neutral)
-            }
-            .sliderNeutralValue(neutral)
-            .labelsHidden()
-        }
     }
 }

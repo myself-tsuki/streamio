@@ -16,6 +16,8 @@ final class CaptureDeviceManager {
     private(set) var microphones: [DeviceItem] = []
     private(set) var displays: [DisplayItem] = []
 
+    /// Called after any camera, microphone or display is plugged in or removed.
+    @ObservationIgnored var onChange: (() -> Void)?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
 
     init() {
@@ -23,11 +25,17 @@ final class CaptureDeviceManager {
         let center = NotificationCenter.default
         for name in [NSNotification.Name.AVCaptureDeviceWasConnected, .AVCaptureDeviceWasDisconnected] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refreshDevices() }
+                MainActor.assumeIsolated {
+                    self?.refreshDevices()
+                    self?.onChange?()
+                }
             })
         }
         observers.append(center.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshDisplays() }
+            MainActor.assumeIsolated {
+                self?.refreshDisplays()
+                self?.onChange?()
+            }
         })
         refreshDisplays()
     }
@@ -57,26 +65,42 @@ final class CaptureDeviceManager {
         }
     }
 
+    /// Exact device lookup. A missing device returns nil: Streamio never substitutes another one.
     func camera(id: String) -> AVCaptureDevice? {
-        AVCaptureDevice(uniqueID: id)
+        guard !id.isEmpty, cameras.contains(where: { $0.id == id }) else { return nil }
+        return AVCaptureDevice(uniqueID: id)
     }
 
+    /// Exact device lookup, like `camera(id:)`. No "system default" fallback.
     func microphone(id: String) -> AVCaptureDevice? {
-        id.isEmpty ? AVCaptureDevice.default(for: .audio) : AVCaptureDevice(uniqueID: id)
+        guard !id.isEmpty, microphones.contains(where: { $0.id == id }) else { return nil }
+        return AVCaptureDevice(uniqueID: id)
     }
 
-    var defaultCameraID: String? {
-        cameras.first(where: \.isDefault)?.id ?? cameras.first?.id
+    func isConnected(_ source: VideoSource) -> Bool {
+        switch source {
+        case .camera(let id): cameras.contains { $0.id == id }
+        case .display(let id): displays.contains { $0.id == id }
+        case .image(let path): FileManager.default.fileExists(atPath: path)
+        }
+    }
+
+    func cameraName(id: String) -> String {
+        cameras.first { $0.id == id }?.name ?? String(localized: "Disconnected Camera")
+    }
+
+    func microphoneName(id: String) -> String {
+        microphones.first { $0.id == id }?.name ?? String(localized: "Disconnected Microphone")
     }
 
     func name(for source: VideoSource) -> String {
         switch source {
-        case .none:
-            String(localized: "No Source")
         case .camera(let id):
-            cameras.first { $0.id == id }?.name ?? String(localized: "Disconnected Camera")
+            cameraName(id: id)
         case .display(let id):
             displays.first { $0.id == id }?.name ?? String(localized: "Disconnected Display")
+        case .image(let path):
+            URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
         }
     }
 }

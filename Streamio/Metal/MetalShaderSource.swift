@@ -40,6 +40,12 @@ public struct MetalShaderSource {
         float saturation;
         float intensity;
         uint filterType;
+        float uvX;
+        float uvY;
+        float uvWidth;
+        float uvHeight;
+        uint mirror;
+        float opacity;
     };
 
     fragment float4 videoFragmentShader(VertexOut in [[stage_in]],
@@ -48,13 +54,18 @@ public struct MetalShaderSource {
                                        constant ShaderParams &params [[buffer(0)]]) {
         float2 uv = in.texCoords;
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-            return float4(0.0, 0.0, 0.0, 1.0);
+            return float4(0.0, 0.0, 0.0, 0.0);
         }
-        
-        float4 color = texture.sample(textureSampler, uv);
-        
+
+        // Layer transform: optional horizontal mirror, then the crop rectangle.
+        float2 sourceUV = float2(params.mirror != 0 ? 1.0 - uv.x : uv.x, uv.y);
+        sourceUV = float2(params.uvX, params.uvY) + sourceUV * float2(params.uvWidth, params.uvHeight);
+        float4 color = texture.sample(textureSampler, sourceUV);
+        float alpha = color.a;
+        float3 straight = alpha > 0.0 ? color.rgb / alpha : float3(0.0);
+
         // Basic adjustments
-        float3 rgb = color.rgb + float3(params.brightness);
+        float3 rgb = straight + float3(params.brightness);
         rgb = (rgb - 0.5) * params.contrast + 0.5;
         
         float luma = dot(rgb, float3(0.299, 0.587, 0.114));
@@ -106,7 +117,8 @@ public struct MetalShaderSource {
                 float3 greenRef = float3(0.0, 1.0, 0.0);
                 float d = distance(rgb, greenRef);
                 if (d < 0.65) {
-                    filtered = mix(float3(0.05, 0.08, 0.12), rgb, smoothstep(0.4, 0.65, d));
+                    // Keyed pixels become transparent so lower layers show through.
+                    alpha *= mix(1.0, smoothstep(0.4, 0.65, d), params.intensity);
                 }
                 break;
             }
@@ -114,8 +126,10 @@ public struct MetalShaderSource {
                 break;
         }
         
-        float3 result = mix(rgb, filtered, params.intensity);
-        return float4(clamp(result, 0.0, 1.0), 1.0);
+        float3 result = clamp(mix(rgb, filtered, params.intensity), 0.0, 1.0);
+        float outAlpha = clamp(alpha * params.opacity, 0.0, 1.0);
+        // Premultiplied output; the pipeline blends with (one, oneMinusSourceAlpha).
+        return float4(result * outAlpha, outAlpha);
     }
     """
 }
