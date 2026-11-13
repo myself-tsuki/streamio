@@ -20,9 +20,11 @@ struct ScenesDock: View {
         DockPanel(title: "Scenes") {
             List(selection: $studio.selectedSceneID) {
                 ForEach(Array(studio.scenes.enumerated()), id: \.element.id) { index, scene in
+                    let isSelected = studio.selectedSceneID == scene.id
                     HStack {
                         Label(scene.name, systemImage: scene.systemImage)
                             .lineLimit(1)
+                            .font(.body.weight(isSelected ? .semibold : .regular))
                         Spacer()
                         if index < 9 {
                             Text("⌘\(index + 1)")
@@ -31,7 +33,25 @@ struct ScenesDock: View {
                                 .accessibilityLabel("Shortcut Command \(index + 1)")
                         }
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background {
+                        if isSelected {
+                            Capsule()
+                                .fill(Color.accentColor.opacity(0.22))
+                                .overlay(Capsule().stroke(Color.accentColor.opacity(0.5), lineWidth: 1))
+                        } else {
+                            Capsule()
+                                .fill(Color.primary.opacity(0.04))
+                                .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+                        }
+                    }
+                    .clipShape(Capsule())
+                    .contentShape(Capsule())
                     .tag(scene.id)
+                    .listRowInsets(EdgeInsets(top: 2, leading: 4, bottom: 2, trailing: 4))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
                     .contextMenu {
                         Button("Rename…") { beginRename(scene) }
                         Button("Duplicate") { studio.duplicate(scene) }
@@ -100,8 +120,12 @@ struct SourcesDock: View {
             } else {
                 List(selection: $studio.selectedSourceID) {
                     ForEach(sources) { source in
-                        SourceRow(source: source)
+                        let isSelected = studio.selectedSourceID == source.id
+                        SourceRow(source: source, isSelected: isSelected)
                             .tag(source.id)
+                            .listRowInsets(EdgeInsets(top: 2, leading: 4, bottom: 2, trailing: 4))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
                             .contextMenu {
                                 Button(source.isVisible ? "Hide" : "Show") { studio.toggleVisibility(source.id) }
                                 Button("Move Up") { studio.moveSource(source.id, by: -1) }
@@ -144,16 +168,18 @@ struct SourcesDock: View {
 struct SourceRow: View {
     @Environment(StudioController.self) private var studio
     let source: SceneSource
+    var isSelected: Bool = false
 
     var body: some View {
         let connected = studio.devices.isConnected(source.input)
         HStack(spacing: Theme.spacingS) {
             Image(systemName: source.input.systemImage)
                 .frame(width: 20)
-                .foregroundStyle(source.isVisible ? Color.primary : Color.secondary)
+                .foregroundStyle(source.isVisible ? (isSelected ? Color.accentColor : Color.primary) : Color.secondary)
             VStack(alignment: .leading, spacing: 0) {
                 Text(source.name)
                     .lineLimit(1)
+                    .font(.body.weight(isSelected ? .semibold : .regular))
                     .foregroundStyle(source.isVisible ? Color.primary : Color.secondary)
                 if !connected {
                     Label("Disconnected", systemImage: "exclamationmark.triangle.fill")
@@ -175,6 +201,21 @@ struct SourceRow: View {
             .frame(minWidth: 24, minHeight: 24)
             .help(source.isVisible ? "Hide source" : "Show source")
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background {
+            if isSelected {
+                Capsule()
+                    .fill(Color.accentColor.opacity(0.22))
+                    .overlay(Capsule().stroke(Color.accentColor.opacity(0.5), lineWidth: 1))
+            } else {
+                Capsule()
+                    .fill(Color.primary.opacity(0.04))
+                    .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+            }
+        }
+        .clipShape(Capsule())
+        .contentShape(Capsule())
         .accessibilityElement(children: .combine)
     }
 }
@@ -253,19 +294,49 @@ struct ControlsDock: View {
         DockPanel(title: "Controls") {
             VStack(spacing: Theme.spacingS) {
                 Button(action: studio.toggleStreaming) {
-                    VStack(spacing: 2) {
-                        Label(studio.streamStatus.isActive ? "Stop Streaming" : "Start Streaming",
-                              systemImage: studio.streamStatus.isActive ? "stop.fill" : "dot.radiowaves.left.and.right")
-                        if !studio.streamStatus.isActive {
-                            Text(enabledCount == 1 ? "to 1 destination" : "to \(enabledCount) destinations")
-                                .font(.caption)
-                                .opacity(0.85)
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
+                    Label(studio.streamStatus.isActive ? "Stop Streaming" : "Start Streaming",
+                          systemImage: studio.streamStatus.isActive ? "stop.fill" : "dot.radiowaves.left.and.right")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.glassProminent)
                 .tint(studio.streamStatus.isActive ? Theme.live : .accentColor)
+
+                // Separate Destinations Control
+                Menu {
+                    if studio.destinations.isEmpty {
+                        Text("No destinations configured")
+                    } else {
+                        ForEach(studio.destinations) { destination in
+                            Toggle(destination.name, isOn: Binding(
+                                get: { studio.destinations.first { $0.id == destination.id }?.isEnabled ?? false },
+                                set: { value in
+                                    if let index = studio.destinations.firstIndex(where: { $0.id == destination.id }) {
+                                        studio.destinations[index].isEnabled = value
+                                    }
+                                }
+                            ))
+                        }
+                    }
+                    Divider()
+                    SettingsLink {
+                        Label("Manage Destinations…", systemImage: "slider.horizontal.3")
+                    }
+                } label: {
+                    HStack(spacing: Theme.spacingS) {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .foregroundStyle(enabledCount > 0 ? Color.accentColor : Color.secondary)
+                        Text(enabledCount == 0 ? "No Destinations" : (enabledCount == 1 ? "1 Destination" : "\(enabledCount) Destinations"))
+                            .font(.callout)
+                            .lineLimit(1)
+                        Spacer()
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+                .help("Select destinations for streaming")
 
                 Button(action: studio.toggleRecording) {
                     Label(studio.isRecording ? "Stop Recording" : "Start Recording",
