@@ -42,6 +42,8 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
     private var sessionStart: CMTime?
     private var isActive = false
     private var pendingAudio: [CMSampleBuffer] = []
+    private var pendingVideo: [CMSampleBuffer] = []
+    private var stopRequestedAt: Date?
 
     public init() {}
 
@@ -58,6 +60,7 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
             audioInput = nil
             sessionStart = nil
             pendingAudio.removeAll()
+            pendingVideo.removeAll()
             isActive = true
         }
         return url
@@ -80,8 +83,13 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
                 sessionStart = start
                 if let outputURL { onEvent?(.started(outputURL)) }
             }
-            if videoInput.isReadyForMoreMediaData {
-                videoInput.append(frame.sampleBuffer)
+            // Never drop a recorded video frame: a missing P-frame smears the picture until the next
+            // keyframe. If the writer is busy, queue the frame and write it in order when it is ready.
+            pendingVideo.append(frame.sampleBuffer)
+            drainPendingVideo(into: videoInput)
+            if pendingVideo.count > 300 {
+                DiagnosticsLog.log("recorder", "writer is far behind: \(pendingVideo.count) video frames queued")
+                pendingVideo.removeFirst(pendingVideo.count - 300)
             }
         }
     }
@@ -112,12 +120,15 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
                 onEvent?(.failed(String(localized: "Recording stopped before any video was written.")))
                 return
             }
+            if let videoInput { drainPendingVideo(into: videoInput) }
             if let audioInput { drainPendingAudio(into: audioInput) }
+            let stopStarted = Date.now
             videoInput?.markAsFinished()
             audioInput?.markAsFinished()
             let url = outputURL
             writer.finishWriting { [self] in
                 queue.async { [self] in
+                    DiagnosticsLog.log("recorder", "finished writing in \(String(format: "%.1f", Date.now.timeIntervalSince(stopStarted))) s, status \(writer.status.rawValue)")
                     if writer.status == .completed, let url {
                         onEvent?(.finished(url))
                     } else {
@@ -131,9 +142,20 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
 
     // MARK: - Private
 
+    private func drainPendingVideo(into input: AVAssetWriterInput) {
+        while let first = pendingVideo.first, input.isReadyForMoreMediaData {
+            if !input.append(first) {
+                DiagnosticsLog.log("recorder", "video append failed: \(writer?.error?.localizedDescription ?? "unknown")")
+            }
+            pendingVideo.removeFirst()
+        }
+    }
+
     private func drainPendingAudio(into input: AVAssetWriterInput) {
         while let first = pendingAudio.first, input.isReadyForMoreMediaData {
-            input.append(first)
+            if !input.append(first) {
+                DiagnosticsLog.log("recorder", "audio append failed: \(writer?.error?.localizedDescription ?? "unknown")")
+            }
             pendingAudio.removeFirst()
         }
     }
@@ -144,10 +166,8 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
         do {
             let writer = try AVAssetWriter(outputURL: outputURL, fileType: settings.format.fileType)
             // No "optimize for network use": that rewrites the whole file when recording stops, which
-            // took minutes for long recordings. Fragments keep stop instant and the file playable
-            // even if the app or the Mac dies mid-recording.
+            // took minutes for long recordings.
             writer.shouldOptimizeForNetworkUse = false
-            writer.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
 
             let video = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: formatHint)
             video.expectsMediaDataInRealTime = true
@@ -190,6 +210,7 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
 
     private func resetState() {
         pendingAudio.removeAll()
+        pendingVideo.removeAll()
         writer = nil
         videoInput = nil
         audioInput = nil

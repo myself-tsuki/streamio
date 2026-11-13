@@ -218,6 +218,7 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
                 if isKeyFrame {
                     // Longer outage than the buffer holds: skip the stale video and resume from this
                     // keyframe. Audio stays, so sound never has a hole.
+                    DiagnosticsLog.log("rtmp", String(format: "buffer over limit (%.1f s): skipping to newest keyframe", Double(backlog) / bytesPerSecond))
                     discardPendingVideo()
                 } else {
                     stats.droppedVideoFrames += 1
@@ -398,6 +399,7 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
     }
 
     private func setStatus(_ status: StreamStatus) {
+        DiagnosticsLog.log("rtmp", "status: \(status.label)")
         onEvent?(.status(status))
     }
 
@@ -692,7 +694,8 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
         let floor = max(0.25, min(1, 1_500_000 / Double(max(configuration?.videoBitrate ?? 1, 1))))
         var next = adaptiveFactor
         if cutCooldown > 0 { cutCooldown -= 1 }
-        if seconds > 1.0 {
+        // Only a real backlog counts: a big keyframe alone can briefly hold a second of data.
+        if seconds > 2.5 {
             calmTicks = 0
             if cutCooldown == 0 {
                 next = max(floor, adaptiveFactor * 0.65)
@@ -708,6 +711,7 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
             calmTicks = 0
         }
         if abs(next - adaptiveFactor) > 0.001 {
+            DiagnosticsLog.log("rtmp", String(format: "adaptive bitrate %.0f%% → %.0f%% (buffer %.1f s)", adaptiveFactor * 100, next * 100, seconds))
             adaptiveFactor = next
             onBitrateAdvice?(next)
         }

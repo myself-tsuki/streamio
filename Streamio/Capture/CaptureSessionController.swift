@@ -45,17 +45,6 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
             videoOutput.alwaysDiscardsLateVideoFrames = true
             videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
             if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
-
-            // macOS lets us ask for the mixer's native format directly, saving a conversion.
-            audioOutput.audioSettings = [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: AudioMixer.sampleRate,
-                AVNumberOfChannelsKey: Int(AudioMixer.channelCount),
-                AVLinearPCMIsFloatKey: true,
-                AVLinearPCMBitDepthKey: 32,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsNonInterleaved: true
-            ]
             audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
             if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
             session.commitConfiguration()
@@ -66,6 +55,7 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
         timer.schedule(deadline: .now() + 2, repeating: 2)
         timer.setEventHandler { [weak self] in
             guard let self, self.audioInput != nil, self.session.isRunning, self.heartbeat.silence > 3 else { return }
+            DiagnosticsLog.log("capture", "audio input silent for \(Int(self.heartbeat.silence)) s: restarting capture session")
             self.session.stopRunning()
             self.session.startRunning()
             self.heartbeat.beat()
@@ -77,6 +67,7 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
             forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
         ) { [weak self] notification in
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
+            DiagnosticsLog.log("capture", "session runtime error: \(error?.localizedDescription ?? "unknown")")
             self?.onError?(error?.localizedDescription ?? String(localized: "The capture session stopped unexpectedly."))
             self?.restartAfterError()
         }

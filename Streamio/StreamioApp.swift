@@ -54,6 +54,9 @@ struct StreamioApp: App {
                 }
                 .disabled(!permissions.allGranted)
                 Divider()
+                Button("Show Diagnostics Log") {
+                    NSWorkspace.shared.activateFileViewerSelecting([DiagnosticsLog.fileURL])
+                }
                 Button("Show Recordings", action: studio.revealRecordings)
                     .keyboardShortcut("o", modifiers: [.command, .shift])
             }

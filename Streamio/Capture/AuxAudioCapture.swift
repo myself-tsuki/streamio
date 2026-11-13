@@ -35,21 +35,13 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
 
     override init() {
         super.init()
-        output.audioSettings = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: AudioMixer.sampleRate,
-            AVNumberOfChannelsKey: Int(AudioMixer.channelCount),
-            AVLinearPCMIsFloatKey: true,
-            AVLinearPCMBitDepthKey: 32,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsNonInterleaved: true
-        ]
         output.setSampleBufferDelegate(self, queue: queue)
         // A USB device that hiccups can leave the session running but silent. Restart it.
         let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
         timer.schedule(deadline: .now() + 2, repeating: 2)
         timer.setEventHandler { [weak self] in
             guard let self, self.input != nil, self.session.isRunning, self.heartbeat.silence > 3 else { return }
+            DiagnosticsLog.log("capture", "audio input silent for \(Int(self.heartbeat.silence)) s: restarting capture session")
             self.session.stopRunning()
             self.session.startRunning()
             self.heartbeat.beat()

@@ -76,11 +76,24 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
     private let steerBand = 768
     private var scratchLeft = [Float](repeating: 0, count: 1_024)
     private var scratchRight = [Float](repeating: 0, count: 1_024)
-    /// More than this queued (150 ms) means the source runs fast; trim back to the cushion.
-    private let maxBufferedFrames = 7_200
     /// Audio is stamped a little early to account for the cushion and device latency (A/V sync).
     private let latencyCompensation = 0.04
     private var primed: [AudioChannelID: Bool] = [:]
+    private var chunkMax: [AudioChannelID: Int] = [:]
+    private var emaLevel: [AudioChannelID: Double] = [:]
+    private var steerTarget: [AudioChannelID: Double] = [:]
+    private var steerTick: [AudioChannelID: Int] = [:]
+
+    /// Health counters, written to the diagnostics log every 10 seconds.
+    private struct Counters {
+        var arrivals = 0
+        var underruns = 0
+        var trims = 0
+        var skips = 0
+        var stretches = 0
+    }
+    private var counters: [AudioChannelID: Counters] = [:]
+    private var lastSummary = 0.0
     private var timelineStart: Double?
     private var emittedFrames: Int64 = 0
 
@@ -133,7 +146,9 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
             due -= Int64(chunkFrames)
         }
         levels = collectMeters(now: now)
+        let summary = healthSummary(now: now)
         lock.unlock()
+        if let summary { DiagnosticsLog.log("audio", summary) }
 
         for (buffer, time) in outputs { onMixedAudio?(buffer, time) }
         if let levels { onLevels?(levels) }
@@ -150,6 +165,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
             converters[channel] = nil
             lastArrival[channel] = nil
             primed[channel] = false
+            chunkMax[channel] = nil
             meters[channel] = nil
         }
     }
@@ -192,6 +208,23 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
                                   right: UnsafeBufferPointer(start: right, count: frames))
         }
         lastArrival[channel] = Self.hostSeconds()
+        chunkMax[channel] = max(frames, (chunkMax[channel] ?? 0) * 999 / 1000)
+        counters[channel, default: Counters()].arrivals += 1
+    }
+
+    /// One line per active input every 10 s: deliveries, buffer cushion, underruns and corrections.
+    private func healthSummary(now: Double) -> String? {
+        guard now - lastSummary >= 10 else { return nil }
+        lastSummary = now
+        var parts: [String] = []
+        for channel in AudioChannelID.allCases {
+            guard let count = counters[channel], count.arrivals > 0 || primed[channel] == true else { continue }
+            parts.append("\(channel.rawValue): in=\(count.arrivals) chunk=\(chunkMax[channel] ?? 0) "
+                         + "buf=\(rings[channel]?.availableFrames ?? 0) underrun=\(count.underruns) "
+                         + "trim=\(count.trims) skip=\(count.skips) stretch=\(count.stretches)")
+        }
+        counters.removeAll()
+        return parts.isEmpty ? "no audio input delivering" : parts.joined(separator: " | ")
     }
 
     /// Builds one chunk of the mix. Called with the lock held.
@@ -210,25 +243,45 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
 
         for channel in AudioChannelID.allCases {
             guard var available = rings[channel]?.availableFrames else { continue }
+            // Devices deliver in very different chunk sizes (10 ms to 100 ms). The cushion follows the
+            // largest recent chunk, so a big-chunk device never runs dry between deliveries.
+            let chunk = chunkMax[channel] ?? 0
+            let prime = max(primeFrames, chunk + 1_536)
             if primed[channel] != true {
-                guard available >= primeFrames else { continue }
+                guard available >= prime else { continue }
                 primed[channel] = true
+                emaLevel[channel] = Double(available)
+                steerTarget[channel] = Double(available)
             }
-            if available > maxBufferedFrames {
-                rings[channel]?.skip(available - primeFrames)
-                available = primeFrames
+            if available > prime + chunk * 2 + 2_400 {
+                rings[channel]?.skip(available - prime)
+                available = prime
+                counters[channel, default: Counters()].trims += 1
+                emaLevel[channel] = Double(available)
+                steerTarget[channel] = Double(available)
             }
             if available < frames {
                 // A real stall: play what there is, then wait for the cushion to refill.
                 primed[channel] = false
+                counters[channel, default: Counters()].underruns += 1
             }
 
-            // Steer the buffer level toward the target.
+            // Slow drift correction: smooth the buffer level, and when it has wandered from where it
+            // started, consume one frame more or fewer on every 8th chunk (a 0.01 % speed change).
+            let ema = (emaLevel[channel] ?? Double(available)) * 0.98 + Double(available) * 0.02
+            emaLevel[channel] = ema
+            let band = Double(max(steerBand, chunk))
+            let target = steerTarget[channel] ?? ema
+            steerTick[channel, default: 0] += 1
             var take = frames
-            if available > primeFrames + steerBand, available > frames + 1 {
-                rings[channel]?.skip(1)          // source is fast: drop one frame
-            } else if available < primeFrames - steerBand, available >= frames {
-                take = frames - 1                // source is slow: stretch by one frame
+            if steerTick[channel, default: 0] % 8 == 0 {
+                if ema > target + band, available > frames + 1 {
+                    rings[channel]?.skip(1)
+                    counters[channel, default: Counters()].skips += 1
+                } else if ema < target - band, available >= frames {
+                    take = frames - 1
+                    counters[channel, default: Counters()].stretches += 1
+                }
             }
 
             scratchLeft.withUnsafeMutableBufferPointer { left in
