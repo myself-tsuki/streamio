@@ -11,6 +11,7 @@ import SwiftUI
 struct StreamioApp: App {
     @State private var studio = StudioController()
     @State private var permissions = PermissionsManager()
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         // One studio window: capture devices can only be owned once.
@@ -69,12 +70,28 @@ struct StreamioApp: App {
                        action: studio.toggleFullscreenPreview)
                     .keyboardShortcut("f", modifiers: [.command, .shift])
                     .disabled(!permissions.allGranted)
-                Button(studio.showsStatsOverlay ? "Hide Fullscreen Stats" : "Show Fullscreen Stats") {
+                Button("Pop Out Program Output") {
+                    openWindow(id: "program")
+                    studio.moveProgramWindowToOtherScreen()
+                }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .disabled(!permissions.allGranted)
+                Button(studio.showsStatsOverlay ? "Hide Preview Widgets" : "Show Preview Widgets") {
                     studio.showsStatsOverlay.toggle()
                 }
-                .disabled(!studio.isFullscreenPreview)
+                Button(studio.widgets.showsBar ? "Hide Bottom Bar" : "Show Bottom Bar") {
+                    studio.widgets.showsBar.toggle()
+                }
             }
         }
+
+        // Program output on its own window, so the studio and the output can use two displays.
+        Window(StudioController.programWindowTitle, id: "program") {
+            ProgramWindowView()
+                .environment(studio)
+                .environment(permissions)
+        }
+        .defaultSize(width: 1280, height: 720)
 
         Settings {
             SettingsView()

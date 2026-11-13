@@ -69,12 +69,14 @@ final class StudioController {
     var alertMessage: String?
 
     let stats = StudioStats()
+    let widgets = WidgetLayout()
     let meters = AudioMeterModel()
     let devices = CaptureDeviceManager()
 
     @ObservationIgnored private let pipeline = MediaPipeline()
     @ObservationIgnored private let monitor = SystemMonitor()
     @ObservationIgnored private var statsTask: Task<Void, Never>?
+    @ObservationIgnored private var isPinging = false
     @ObservationIgnored private var isLoading = true
     private var streamKeys: [UUID: String] = [:]
     @ObservationIgnored private var activeCameraID: String?
@@ -642,9 +644,12 @@ final class StudioController {
 
     private func startStatsLoop() {
         statsTask = Task { [weak self] in
+            var tick = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
+                if tick % 3 == 0 { refreshPing() }
+                tick += 1
                 let usage = monitor.sample()
                 stats.cpuPercent = usage.cpuPercent
                 stats.gpuPercent = usage.gpuPercent
@@ -656,6 +661,44 @@ final class StudioController {
                 }
                 if !streamStatus.isActive { stats.bitrateKbps = 0 }
             }
+        }
+    }
+
+    /// Pings the live destination, or the first enabled one while idle.
+    private func refreshPing() {
+        guard !isPinging else { return }
+        let target = destinations.first { status(of: $0.id).isActive } ?? destinations.first { $0.isEnabled }
+        guard let endpoint = target.flatMap({ RTMPEndpoint(urlString: $0.serverURL) }) else {
+            stats.pingMilliseconds = nil
+            return
+        }
+        isPinging = true
+        Task { [weak self] in
+            let result = await PingProbe.measure(host: endpoint.host, port: endpoint.port)
+            self?.stats.pingMilliseconds = result
+            self?.isPinging = false
+        }
+    }
+
+    // MARK: - Pop-out window
+
+    static let programWindowTitle = "Program Output"
+
+    /// Moves the pop-out window to another display when one is connected, so the studio
+    /// stays on one screen and the program output fills the other.
+    func moveProgramWindowToOtherScreen() {
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            let windows = NSApp.windows
+            guard let popout = windows.first(where: { $0.title == Self.programWindowTitle }),
+                  let studioWindow = windows.first(where: { $0.title != Self.programWindowTitle && $0.canBecomeMain && $0.isVisible }),
+                  let other = NSScreen.screens.first(where: { $0 != studioWindow.screen }) else { return }
+            var frame = popout.frame
+            let area = other.visibleFrame
+            frame.size.width = min(max(frame.width, 960), area.width)
+            frame.size.height = min(max(frame.height, 540), area.height)
+            frame.origin = CGPoint(x: area.midX - frame.width / 2, y: area.midY - frame.height / 2)
+            popout.setFrame(frame, display: true, animate: true)
         }
     }
 

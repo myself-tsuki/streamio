@@ -4,20 +4,22 @@
 //
 //  Root window, laid out like OBS Studio: scenes and sources in the left sidebar, the program
 //  preview on top with the audio mixer under it, broadcast controls, destinations and source
-//  properties on the right, and live stats along the foot. Fullscreen mode shows only the
-//  program output with the stats bar floating over it.
+//  properties on the right, and a customizable stats bar along the foot. Fullscreen mode and
+//  the pop-out window show the program output with widgets over it (see StudioStage).
 //
 
 import SwiftUI
 
 struct StudioView: View {
     @Environment(StudioController.self) private var studio
+    @Environment(\.openWindow) private var openWindow
     @State private var showsSidebar = true
+    @State private var showsCustomizer = false
 
     var body: some View {
         Group {
             if studio.isFullscreenPreview {
-                FullscreenProgramView()
+                StudioStage(mode: .fullscreen)
             } else {
                 studioLayout
             }
@@ -81,7 +83,17 @@ struct StudioView: View {
                 }
                 .help("Show or hide the Scenes and Sources sidebar")
             }
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button("Customize Widgets", systemImage: "slider.horizontal.3") { showsCustomizer.toggle() }
+                    .popover(isPresented: $showsCustomizer, arrowEdge: .bottom) {
+                        WidgetCustomizer(initialTab: .bar).environment(studio)
+                    }
+                    .help("Choose what the bottom bar and the preview widgets show")
+                Button("Pop Out Preview", systemImage: "rectangle.on.rectangle") {
+                    openWindow(id: "program")
+                    studio.moveProgramWindowToOtherScreen()
+                }
+                .help("Open the program output in its own window, for a second display")
                 Button("Fullscreen Preview", systemImage: "arrow.up.left.and.arrow.down.right") {
                     studio.setFullscreenPreview(true)
                 }
@@ -191,70 +203,21 @@ struct OnAirBadges: View {
     }
 }
 
-// MARK: - Fullscreen
-
-struct FullscreenProgramView: View {
-    @Environment(StudioController.self) private var studio
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        @Bindable var studio = studio
-        ZStack {
-            Color.black.ignoresSafeArea()
-            ProgramView(cornerRadius: 0) { studio.setFullscreenPreview(false) }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
-        }
-        .overlay(alignment: .topLeading) { OnAirBadges().padding(Theme.spacingL) }
-        .overlay(alignment: .topTrailing) {
-            HStack(spacing: Theme.spacingS) {
-                Button(studio.showsStatsOverlay ? "Hide Stats" : "Show Stats", systemImage: "chart.bar.xaxis") {
-                    studio.showsStatsOverlay.toggle()
-                }
-                .help("Show or hide the stats bar (I)")
-                Button("Exit Fullscreen", systemImage: "arrow.down.right.and.arrow.up.left") {
-                    studio.setFullscreenPreview(false)
-                }
-                .help("Exit fullscreen (Esc)")
-            }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.glass)
-            .controlSize(.large)
-            .padding(Theme.spacingL)
-        }
-        .overlay(alignment: .bottom) {
-            if studio.showsStatsOverlay {
-                StatsBar(style: .overlay)
-                    .padding(Theme.spacingL)
-                    .transition(.opacity)
-            }
-        }
-        .animation(.easeOut(duration: 0.2), value: studio.showsStatsOverlay)
-        .environment(\.colorScheme, .dark)
-        .toolbar(.hidden, for: .windowToolbar)
-        .focusable()
-        .focusEffectDisabled()
-        .focused($isFocused)
-        .onAppear { isFocused = true }
-        .onExitCommand { studio.setFullscreenPreview(false) }
-        .onKeyPress("i") {
-            studio.showsStatsOverlay.toggle()
-            return .handled
-        }
-    }
-}
-
 // MARK: - Stats
 
 struct StudioStatusBar: View {
+    @Environment(StudioController.self) private var studio
+
     var body: some View {
-        StatsBar(style: .statusBar)
+        if studio.widgets.showsBar {
+            StatsBar(style: .statusBar)
+        }
     }
 }
 
-/// Live figures shown at the foot of the studio and over the fullscreen program:
-/// stream and recording timers, output and camera FPS, render time, CPU, GPU, memory,
-/// total and per-destination bitrate, dropped frames and free disk space.
+/// The customizable bar of live figures at the foot of the studio and over the fullscreen
+/// and pop-out program. It holds whichever widgets the user picked, as small labels,
+/// big-number tiles or speedometers (see WidgetLayout). Right-click to hide it.
 struct StatsBar: View {
     enum Style { case statusBar, overlay }
 
@@ -262,55 +225,55 @@ struct StatsBar: View {
     let style: Style
 
     var body: some View {
-        let stats = studio.stats
-        TimelineView(.periodic(from: .now, by: 1)) { context in
+        let items = studio.widgets.bar.filter { widget in
+            // A camera counter means nothing without a camera in the scene.
+            widget.metric != .cameraFPS || studio.selectedScene?.cameraSource != nil
+        }
+        let hasTiles = items.contains { $0.style != .label }
+        let radius: CGFloat = hasTiles ? 28 : 100
+
+        ScrollView(.horizontal) {
             HStack(spacing: Theme.spacingL) {
-                metric(studio.streamStatus.isLive ? "LIVE" : studio.streamStatus.label,
-                       Duration.clock(since: stats.streamStart, now: context.date), "dot.radiowaves.left.and.right")
-                    .foregroundStyle(studio.streamStatus.isLive ? Theme.live : .primary)
-                metric("REC", Duration.clock(since: stats.recordStart, now: context.date), "record.circle")
-                    .foregroundStyle(studio.isRecording ? Theme.live : .primary)
-                Divider().frame(height: 14)
-                metric("FPS", "\(String(format: "%.1f", stats.fps)) / \(studio.frameRate.rawValue)", "film")
-                if studio.selectedScene?.cameraSource != nil {
-                    metric("Camera", "\(String(format: "%.1f", stats.cameraFPS)) fps", "web.camera")
+                if items.isEmpty {
+                    Text("Bar is empty. Add widgets with Customize Widgets.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
-                if style == .overlay {
-                    metric("Render", "\(String(format: "%.1f", stats.renderMilliseconds)) ms", "timer")
-                }
-                Spacer(minLength: Theme.spacingS)
-                metric("CPU", String(format: "%.1f%%", stats.cpuPercent), "cpu")
-                metric("GPU", stats.gpuPercent.map { "\(Int($0))%" } ?? "—", "rectangle.3.group")
-                metric("Memory", ByteCountFormatter.string(fromByteCount: Int64(stats.memoryBytes), countStyle: .memory), "memorychip")
-                Divider().frame(height: 14)
-                metric("Bitrate", "\(Int(stats.bitrateKbps)) kb/s", "speedometer")
-                    .foregroundStyle(stats.congestion > 0.5 ? Theme.warning : .primary)
-                if style == .overlay {
-                    ForEach(studio.destinations.filter { studio.status(of: $0.id).isActive }) { destination in
-                        metric(destination.name, "\(Int(stats.network[destination.id]?.bitrateKbps ?? 0)) kb/s",
-                               studio.status(of: destination.id).systemImage)
-                            .foregroundStyle(studio.status(of: destination.id).tint)
-                    }
-                }
-                metric("Dropped", "\(stats.droppedFrames) (\(String(format: "%.1f", stats.droppedPercent))%)",
-                       "exclamationmark.triangle")
-                if style == .overlay, let free = stats.diskFreeBytes {
-                    metric("Disk", "\(ByteCountFormatter.string(fromByteCount: Int64(free), countStyle: .file)) free", "internaldrive")
+                ForEach(items) { widget in
+                    StatWidgetFace(widget: widget, unit: Self.tileHeight, chrome: false)
+                        .frame(width: width(of: widget), height: height(of: widget))
                 }
             }
-            .font(style == .overlay ? .body.monospacedDigit() : .callout.monospacedDigit())
-            .lineLimit(1)
-            .minimumScaleFactor(0.75)
+            .padding(.horizontal, Theme.spacingL)
+            .padding(.vertical, hasTiles ? Theme.spacingS : (style == .overlay ? Theme.spacingM : Theme.spacingS))
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .center)
         }
-        .padding(.horizontal, Theme.spacingL)
-        .padding(.vertical, style == .overlay ? Theme.spacingM : Theme.spacingS)
-        .glassEffect(.regular, in: .capsule)
+        .scrollIndicators(.hidden)
+        .fixedSize(horizontal: false, vertical: true)
+        .glassEffect(.regular, in: .rect(cornerRadius: radius))
+        .contextMenu {
+            Button("Hide Bottom Bar") { studio.widgets.showsBar = false }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Studio statistics")
     }
 
-    private func metric(_ title: String, _ value: String, _ symbol: String) -> some View {
-        Label { Text("\(title) \(value)") } icon: { Image(systemName: symbol) }
-            .accessibilityElement(children: .combine)
+    private static let tileHeight: CGFloat = 52
+    private static let gaugeSide: CGFloat = 92
+
+    private func width(of widget: StatWidget) -> CGFloat? {
+        switch widget.style {
+        case .label: nil
+        case .number: 132
+        case .gauge: widget.metric.supportsGauge ? Self.gaugeSide : 132
+        }
+    }
+
+    private func height(of widget: StatWidget) -> CGFloat? {
+        switch widget.style {
+        case .label: nil
+        case .number: Self.tileHeight
+        case .gauge: widget.metric.supportsGauge ? Self.gaugeSide : Self.tileHeight
+        }
     }
 }

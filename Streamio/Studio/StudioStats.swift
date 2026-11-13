@@ -29,6 +29,8 @@ final class StudioStats {
     var gpuPercent: Double?
     var memoryBytes: UInt64 = 0
     var diskFreeBytes: Int64?
+    /// Round trip to the ingest server, nil until measured or when unreachable.
+    var pingMilliseconds: Double?
     var streamStart: Date?
     var recordStart: Date?
     var recordedBytes: Int64 = 0
