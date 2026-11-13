@@ -74,6 +74,59 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
             rings[channel] = AudioRingBuffer(capacity: Int(Self.sampleRate) / 2)
             settings[channel] = ChannelSettings()
         }
+        startSilenceClock()
+    }
+
+    // MARK: - Silence fallback
+
+    // If the microphone and desktop audio both stop delivering (cable pulled), nothing would clock
+    // the mix and the stream and recording would lose their audio track mid-way. This timer keeps
+    // emitting silence until a real source is back.
+    private let silenceQueue = DispatchQueue(label: "com.streamio.mixer.silence", qos: .userInteractive)
+    private var silenceTimer: DispatchSourceTimer?
+    private var lastArrival: [AudioChannelID: Double] = [:]
+    private var syntheticNext: Double?
+    private var silenceTicks = 0
+    private let silenceChunk = 1_024
+    private let sourceTimeout = 0.3
+
+    private static func hostSeconds() -> Double {
+        CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+    }
+
+    private func startSilenceClock() {
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: silenceQueue)
+        let interval = Double(silenceChunk) / Self.sampleRate
+        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(2))
+        timer.setEventHandler { [weak self] in self?.fillGap() }
+        timer.resume()
+        silenceTimer = timer
+    }
+
+    private func fillGap() {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Self.hostSeconds()
+        let hasLiveSource = AudioChannelID.allCases.contains { channel in
+            lastArrival[channel].map { now - $0 < sourceTimeout } ?? false
+        }
+        guard !hasLiveSource else {
+            syntheticNext = nil
+            return
+        }
+        let time: Double
+        if let next = syntheticNext, abs(now - next) < 0.2 { time = next } else { time = now }
+        syntheticNext = time + Double(silenceChunk) / Self.sampleRate
+        emitMix(frames: silenceChunk, time: time)
+
+        // Meters would otherwise freeze at their last reading.
+        silenceTicks += 1
+        if silenceTicks % 5 == 0 {
+            meters.removeAll(keepingCapacity: true)
+            var readings: [AudioChannelID: AudioLevels] = [:]
+            for channel in AudioChannelID.allCases { readings[channel] = .silent }
+            onLevels?(readings)
+        }
     }
 
     public func setSettings(_ newSettings: ChannelSettings, for channel: AudioChannelID) {
@@ -86,6 +139,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
             rings[channel]?.removeAll()
             converters[channel] = nil
             lastDelivery[channel] = nil
+            lastArrival[channel] = nil
             meters[channel] = nil
         }
     }
@@ -129,6 +183,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
                                   right: UnsafeBufferPointer(start: right, count: frames))
         }
         lastDelivery[channel] = time
+        lastArrival[channel] = Self.hostSeconds()
 
         if channel == clockChannel(now: time) {
             emitMix(frames: frames, time: time)

@@ -93,9 +93,18 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
     private var renderTimeThisWindow: Double = 0
     private var windowStart: Double = 0
 
-    /// A source that stops delivering keeps its last frame on screen this long (OBS behaviour),
-    /// then its layer is dropped so an unplugged camera does not freeze the picture forever.
+    /// A display that stops delivering keeps its last frame on screen this long (OBS behaviour),
+    /// then its layer is dropped.
     private let holdLastFrameSeconds: Double = 5
+    /// A camera that stops delivering (loose cable) freezes for this long, then the "No signal"
+    /// card takes over. Streaming and recording carry on underneath.
+    private let cameraHoldSeconds: Double = 1.5
+    /// With no frame at all (just switched, or unplugged before it ever delivered) wait this long
+    /// before showing the card, so a normal camera start-up does not flash it.
+    private let cameraStartGraceSeconds: Double = 2.5
+    // Touched only from the clock queue.
+    private var cameraMissingSince: Double?
+    private lazy var signalSlate: CVPixelBuffer? = SignalSlate.makePixelBuffer()
 
     private let clockQueue = DispatchQueue(label: "com.streamio.canvas.clock", qos: .userInteractive)
     private let imageQueue = DispatchQueue(label: "com.streamio.canvas.images", qos: .utility)
@@ -336,16 +345,19 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
             case .image(let path):
                 buffer = stills[path]
             case .camera, .display:
-                if let frame = slots[layer.input], started - frame.arrival < holdLastFrameSeconds {
+                if layer.input == .camera {
+                    buffer = cameraBuffer(slots[.camera], now: started)
+                } else if let frame = slots[layer.input], started - frame.arrival < holdLastFrameSeconds {
                     buffer = frame.buffer
                 } else {
                     buffer = nil
                 }
             }
             guard let buffer else { continue }
+            let isSlate = buffer === signalSlate
             layers.append(CanvasLayer(source: buffer, layout: layer.layout, pipScale: layer.pipScale,
-                                      isMirrored: layer.isMirrored, opacity: layer.opacity,
-                                      filter: layer.filter, params: layer.params))
+                                      isMirrored: isSlate ? false : layer.isMirrored, opacity: layer.opacity,
+                                      filter: isSlate ? .passthrough : layer.filter, params: layer.params))
         }
 
         guard let canvas = MetalPipeline.shared.composeCanvas(
@@ -357,6 +369,17 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
             videoEncoder.encode(canvas, pts: pts, duration: CMTime(value: 1, timescale: CMTimeScale(max(state.fps, 1))))
         }
         report(renderSeconds: Self.hostSeconds() - started, now: started)
+    }
+
+    /// The camera's newest frame, or the "No signal" card once it has stopped delivering.
+    private func cameraBuffer(_ frame: SourceFrame?, now: Double) -> CVPixelBuffer? {
+        if let frame {
+            cameraMissingSince = nil
+            return now - frame.arrival < cameraHoldSeconds ? frame.buffer : signalSlate
+        }
+        let since = cameraMissingSince ?? now
+        cameraMissingSince = since
+        return now - since >= cameraStartGraceSeconds ? signalSlate : nil
     }
 
     private func report(renderSeconds: Double, now: Double) {

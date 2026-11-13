@@ -131,7 +131,11 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
               let formatHint = CMSampleBufferGetFormatDescription(sampleBuffer) else { return false }
         do {
             let writer = try AVAssetWriter(outputURL: outputURL, fileType: settings.format.fileType)
-            writer.shouldOptimizeForNetworkUse = settings.format == .mp4
+            // No "optimize for network use": that rewrites the whole file when recording stops, which
+            // took minutes for long recordings. Fragments keep stop instant and the file playable
+            // even if the app or the Mac dies mid-recording.
+            writer.shouldOptimizeForNetworkUse = false
+            writer.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
 
             let video = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: formatHint)
             video.expectsMediaDataInRealTime = true

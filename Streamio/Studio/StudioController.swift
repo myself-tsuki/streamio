@@ -62,6 +62,10 @@ final class StudioController {
     // MARK: Runtime state
     private(set) var destinationStatus: [UUID: StreamStatus] = [:]
     private(set) var isRecording = false
+    /// Stop was pressed and the file is being closed. The UI shows it at once.
+    private(set) var isFinalizingRecording = false
+    /// Last capture problem that did not interrupt the broadcast (cable glitch while live).
+    private(set) var captureNotice: String?
     private(set) var lastRecordingURL: URL?
     private(set) var isCaptureAuthorized = false
     private(set) var isFullscreenPreview = false
@@ -439,7 +443,9 @@ final class StudioController {
     }
 
     func toggleRecording() {
+        if isFinalizingRecording { return }
         if isRecording {
+            isFinalizingRecording = true
             pipeline.stopRecording()
             return
         }
@@ -624,21 +630,31 @@ final class StudioController {
             case .finished(let url):
                 lastRecordingURL = url
                 isRecording = false
+                isFinalizingRecording = false
                 stats.recordStart = nil
             case .failed(let message):
                 isRecording = false
+                isFinalizingRecording = false
                 stats.recordStart = nil
                 alertMessage = message
             }
         case .frames(let report):
             stats.fps = report.outputFPS
+            if captureNotice != nil, !isOutputActive { captureNotice = nil }
             stats.cameraFPS = report.cameraFPS
             stats.skippedFrames = report.skippedFrames
             stats.renderMilliseconds = report.renderMilliseconds
         case .levels(let readings):
             meters.apply(readings)
         case .captureError(let message):
-            alertMessage = message
+            // While on air or recording, a device glitch must not pop a modal over the studio:
+            // the output carries on with a "No signal" card and the device is picked up again
+            // when it returns.
+            if isRecording || streamStatus.isActive {
+                captureNotice = message
+            } else {
+                alertMessage = message
+            }
         }
     }
 

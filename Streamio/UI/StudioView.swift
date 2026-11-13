@@ -164,13 +164,19 @@ struct SourceWarnings: View {
     var body: some View {
         let missing = (studio.selectedScene?.sources ?? []).filter { $0.isVisible && !studio.devices.isConnected($0.input) }
         let micMissing = studio.isAudioDeviceMissing(.microphone)
-        if !missing.isEmpty || micMissing {
+        if !missing.isEmpty || micMissing || studio.captureNotice != nil {
             VStack(alignment: .leading, spacing: Theme.spacingXS) {
                 ForEach(missing) { source in
                     Label("\(source.name) is disconnected. Waiting for this device.", systemImage: "exclamationmark.triangle.fill")
                 }
                 if micMissing {
                     Label("\(studio.audioTitle(.microphone)) is disconnected. Waiting for this device.", systemImage: "mic.slash.fill")
+                }
+                if !missing.isEmpty || micMissing, studio.isOutputActive {
+                    Text("The broadcast keeps running and shows \u{201C}No signal\u{201D} until the device is back.")
+                        .font(.footnote)
+                } else if let notice = studio.captureNotice {
+                    Label(notice, systemImage: "exclamationmark.triangle.fill")
                 }
             }
             .font(.callout)

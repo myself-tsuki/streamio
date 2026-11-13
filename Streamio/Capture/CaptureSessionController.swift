@@ -62,6 +62,16 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
         ) { [weak self] notification in
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
             self?.onError?(error?.localizedDescription ?? String(localized: "The capture session stopped unexpectedly."))
+            self?.restartAfterError()
+        }
+    }
+
+    /// A cable glitch can stop the session. Try again shortly so the camera and microphone come
+    /// back by themselves once the device is there.
+    private func restartAfterError() {
+        sessionQueue.asyncAfter(deadline: .now() + 1) { [self] in
+            guard videoInput != nil || audioInput != nil, !session.isRunning else { return }
+            session.startRunning()
         }
     }
 

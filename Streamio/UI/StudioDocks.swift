@@ -291,10 +291,12 @@ struct ControlsDock: View {
                         .padding(.vertical, Theme.spacingXS)
 
                     Button(action: studio.toggleRecording) {
-                        Label(studio.isRecording ? "Stop Recording" : "Start Recording",
+                        Label(studio.isFinalizingRecording ? "Saving Recording…"
+                                : (studio.isRecording ? "Stop Recording" : "Start Recording"),
                               systemImage: studio.isRecording ? "stop.circle.fill" : "record.circle")
                             .frame(maxWidth: .infinity)
                     }
+                    .disabled(studio.isFinalizingRecording)
                     .buttonStyle(.glass)
                     .tint(studio.isRecording ? Theme.live : nil)
 
