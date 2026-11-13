@@ -81,7 +81,7 @@ final class CaptureDeviceManager {
         switch source {
         case .camera(let id): cameras.contains { $0.id == id }
         case .display(let id): displays.contains { $0.id == id }
-        case .image(let path): FileManager.default.fileExists(atPath: path)
+        case .image(let path), .video(let path): FileManager.default.fileExists(atPath: path)
         }
     }
 
@@ -99,7 +99,7 @@ final class CaptureDeviceManager {
             cameraName(id: id)
         case .display(let id):
             displays.first { $0.id == id }?.name ?? String(localized: "Disconnected Display")
-        case .image(let path):
+        case .image(let path), .video(let path):
             URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
         }
     }

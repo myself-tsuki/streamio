@@ -28,6 +28,13 @@ nonisolated private struct ShaderParams {
     var uvHeight: Float = 1
     var mirror: UInt32 = 0
     var opacity: Float = 1
+    var shape: UInt32 = 0
+    var viewWidth: Float = 1
+    var viewHeight: Float = 1
+    var borderWidth: Float = 0
+    var borderRed: Float = 1
+    var borderGreen: Float = 1
+    var borderBlue: Float = 1
 }
 
 /// One source frame to draw onto the canvas.
@@ -39,9 +46,20 @@ nonisolated public struct CanvasLayer: @unchecked Sendable {
     public var opacity: Float
     public var filter: FilterType
     public var params: FilterParameters
+    public var shape: SourceShape
+    public var borderWidth: Double
+    public var borderColor: SourceColor
+    public var offsetX: Double
+    public var offsetY: Double
 
     public init(source: CVPixelBuffer, layout: SourceLayout, pipScale: Double, isMirrored: Bool, opacity: Float,
-                filter: FilterType, params: FilterParameters) {
+                filter: FilterType, params: FilterParameters, shape: SourceShape = .rectangle, borderWidth: Double = 0,
+                borderColor: SourceColor = .white, offsetX: Double = 0, offsetY: Double = 0) {
+        self.shape = shape
+        self.borderWidth = borderWidth
+        self.borderColor = borderColor
+        self.offsetX = offsetX
+        self.offsetY = offsetY
         self.source = source
         self.layout = layout
         self.pipScale = pipScale
@@ -136,7 +154,8 @@ nonisolated public final class MetalPipeline: @unchecked Sendable {
             let placement = CanvasPlacement.make(
                 layout: layer.layout, pipScale: layer.pipScale,
                 contentWidth: CVPixelBufferGetWidth(layer.source), contentHeight: CVPixelBufferGetHeight(layer.source),
-                canvasWidth: width, canvasHeight: height
+                canvasWidth: width, canvasHeight: height,
+                squareCrop: layer.shape.cropsToSquare, offsetX: layer.offsetX, offsetY: layer.offsetY
             )
             var shaderParams = ShaderParams(
                 brightness: layer.params.brightness, contrast: layer.params.contrast,
@@ -144,7 +163,12 @@ nonisolated public final class MetalPipeline: @unchecked Sendable {
                 filterType: layer.filter.shaderCode,
                 uvX: placement.cropX, uvY: placement.cropY,
                 uvWidth: placement.cropWidth, uvHeight: placement.cropHeight,
-                mirror: layer.isMirrored ? 1 : 0, opacity: layer.opacity
+                mirror: layer.isMirrored ? 1 : 0, opacity: layer.opacity,
+                shape: layer.shape.shaderCode,
+                viewWidth: Float(placement.width), viewHeight: Float(placement.height),
+                borderWidth: Float(layer.borderWidth),
+                borderRed: Float(layer.borderColor.red), borderGreen: Float(layer.borderColor.green),
+                borderBlue: Float(layer.borderColor.blue)
             )
             encoder.setViewport(Self.viewport(placement))
             encoder.setFragmentTexture(texture.texture, index: 0)

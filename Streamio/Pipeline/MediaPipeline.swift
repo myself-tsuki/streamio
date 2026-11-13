@@ -25,6 +25,9 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
         case camera
         case display
         case image(String)
+        /// A second (third…) camera by unique ID, shown as an overlay.
+        case extraCamera(String)
+        case video(String)
     }
 
     struct Layer: Equatable, Sendable {
@@ -35,6 +38,11 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
         var opacity: Float
         var filter: FilterType
         var params: FilterParameters
+        var shape: SourceShape = .rectangle
+        var borderWidth: Double = 0
+        var borderColor: SourceColor = .white
+        var offsetX: Double = 0
+        var offsetY: Double = 0
     }
 
     struct VideoState: Equatable, Sendable {
@@ -68,6 +76,8 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
     let monitor: AudioMonitor
     let camera = CaptureSessionController()
     let screen = ScreenCaptureController()
+    let extraCameras = ExtraCameraCapture()
+    private var videoPlayers: [String: VideoFilePlayer] = [:]
     private let videoEncoder = VideoEncoder()
     private let audioEncoder: AudioEncoder
     private let recorder = StreamRecorder()
@@ -120,6 +130,8 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
         camera.onVideo = { [weak self] sample in self?.ingestVideo(sample, into: .camera) }
         camera.onAudio = { [weak self] sample in self?.mixer.ingest(sample, from: .microphone) }
         camera.onError = { [weak self] message in self?.onEvent?(.captureError(message)) }
+        extraCameras.onVideo = { [weak self] id, sample in self?.ingestVideo(sample, into: .extraCamera(id)) }
+        extraCameras.onError = { [weak self] message in self?.onEvent?(.captureError(message)) }
         screen.onVideo = { [weak self] sample in self?.ingestVideo(sample, into: .display) }
         screen.onAudio = { [weak self] sample in self?.mixer.ingest(sample, from: .desktop) }
         screen.onStop = { [weak self] message in
@@ -184,6 +196,14 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
         let (fpsChanged, missingImages) = lock.withLock { () -> (Bool, [String]) in
             let changed = video.fps != state.fps
             video = state
+            var wantedVideos = Set<String>()
+            for layer in state.layers {
+                if case .video(let path) = layer.input {
+                    wantedVideos.insert(path)
+                    if videoPlayers[path] == nil { videoPlayers[path] = VideoFilePlayer(path: path) }
+                }
+            }
+            for path in videoPlayers.keys where !wantedVideos.contains(path) { videoPlayers[path] = nil }
             var missing: [String] = []
             for layer in state.layers {
                 if case .image(let path) = layer.input, images[path] == nil, !loadingImages.contains(path) {
@@ -333,8 +353,8 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
     private func tick() {
         let started = Self.hostSeconds()
         let pts = CMClockGetTime(CMClockGetHostTimeClock())
-        let (state, slots, stills, outputting) = lock.withLock {
-            (video, frames, images, !clients.isEmpty || isRecording)
+        let (state, slots, stills, players, outputting) = lock.withLock {
+            (video, frames, images, videoPlayers, !clients.isEmpty || isRecording)
         }
 
         var layers: [CanvasLayer] = []
@@ -344,6 +364,15 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
             switch layer.input {
             case .image(let path):
                 buffer = stills[path]
+            case .video(let path):
+                buffer = players[path]?.currentFrame()
+            case .extraCamera:
+                // An overlay camera that drops out just disappears; the card is for the main camera.
+                if let frame = slots[layer.input], started - frame.arrival < cameraHoldSeconds {
+                    buffer = frame.buffer
+                } else {
+                    buffer = nil
+                }
             case .camera, .display:
                 if layer.input == .camera {
                     buffer = cameraBuffer(slots[.camera], now: started)
@@ -357,7 +386,9 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
             let isSlate = buffer === signalSlate
             layers.append(CanvasLayer(source: buffer, layout: layer.layout, pipScale: layer.pipScale,
                                       isMirrored: isSlate ? false : layer.isMirrored, opacity: layer.opacity,
-                                      filter: isSlate ? .passthrough : layer.filter, params: layer.params))
+                                      filter: isSlate ? .passthrough : layer.filter, params: layer.params,
+                                      shape: layer.shape, borderWidth: layer.borderWidth, borderColor: layer.borderColor,
+                                      offsetX: layer.offsetX, offsetY: layer.offsetY))
         }
 
         guard let canvas = MetalPipeline.shared.composeCanvas(

@@ -210,7 +210,7 @@ struct AddSourceMenu: View {
 
     var body: some View {
         Menu {
-            Section("Video Capture Device") {
+            Section("Camera (add a second one as a face cam)") {
                 if studio.devices.cameras.isEmpty {
                     Text("No cameras connected")
                 }
@@ -226,6 +226,7 @@ struct AddSourceMenu: View {
                 }
             }
             Button("Image…", systemImage: "photo") { studio.chooseImageSource() }
+            Button("Video File…", systemImage: "film") { studio.chooseVideoSource() }
             Section("Audio") {
                 AudioInputMenu()
                 Button("Desktop Audio", systemImage: "speaker.wave.2") { studio.addDesktopAudio() }
@@ -587,12 +588,41 @@ struct SourcePropertiesForm: View {
                 }
                 if binding.layout.isPictureInPicture {
                     LabeledContent("Size") {
-                        Slider(value: $binding.pipScale, in: 0.1...0.6) { Text("Size") }
+                        Slider(value: $binding.pipScale, in: 0.08...0.6) { Text("Size") }
                             .labelsHidden()
                     }
+                    LabeledContent("Move Right") {
+                        Slider(value: $binding.offsetX, in: -0.5...0.5) { Text("Move horizontally") }
+                            .labelsHidden()
+                    }
+                    LabeledContent("Move Down") {
+                        Slider(value: $binding.offsetY, in: -0.5...0.5) { Text("Move vertically") }
+                            .labelsHidden()
+                    }
+                    Button("Reset Position") {
+                        binding.offsetX = 0
+                        binding.offsetY = 0
+                    }
+                    .disabled(binding.offsetX == 0 && binding.offsetY == 0)
                 }
                 Toggle("Mirror Horizontally", isOn: $binding.isMirrored)
                 adjustment("Opacity", $binding.opacity, 0...1, neutral: 1)
+            }
+            Section("Shape and Border") {
+                Picker("Shape", selection: $binding.shape) {
+                    ForEach(SourceShape.allCases) { Label($0.title, systemImage: $0.systemImage).tag($0) }
+                }
+                if binding.shape.cropsToSquare, !binding.layout.isPictureInPicture {
+                    Text("Square shapes crop the picture. Choose a corner layout to use them as a small overlay.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Border") {
+                    Slider(value: $binding.borderWidth, in: 0...0.1) { Text("Border thickness") }
+                        .labelsHidden()
+                }
+                ColorPicker("Border Colour", selection: borderColor, supportsOpacity: false)
+                    .disabled(binding.borderWidth == 0)
             }
             Section("Filter") {
                 Picker("Filter", selection: $binding.filter) {
@@ -610,6 +640,17 @@ struct SourcePropertiesForm: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .padding(.horizontal, -Theme.spacingM)
+    }
+
+    private var borderColor: Binding<Color> {
+        Binding(
+            get: { Color(.sRGB, red: binding.borderColor.red, green: binding.borderColor.green, blue: binding.borderColor.blue) },
+            set: { color in
+                let resolved = NSColor(color).usingColorSpace(.sRGB) ?? .white
+                binding.borderColor = SourceColor(red: Double(resolved.redComponent), green: Double(resolved.greenComponent),
+                                                  blue: Double(resolved.blueComponent))
+            }
+        )
     }
 
     private func adjustment(_ title: LocalizedStringKey, _ value: Binding<Float>, _ range: ClosedRange<Float>, neutral: Float) -> some View {

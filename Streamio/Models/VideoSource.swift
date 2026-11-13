@@ -14,12 +14,15 @@ nonisolated public enum VideoSource: Hashable, Codable, Sendable {
     case display(id: UInt32)
     /// A still image (PNG, JPEG, HEIC…) such as a logo or "be right back" card.
     case image(path: String)
+    /// A video file played on a loop (silent), for example a clip or a second recording.
+    case video(path: String)
 
     public var systemImage: String {
         switch self {
         case .camera: "web.camera"
         case .display: "display"
         case .image: "photo"
+        case .video: "film"
         }
     }
 
@@ -28,6 +31,7 @@ nonisolated public enum VideoSource: Hashable, Codable, Sendable {
         case .camera: String(localized: "Video Capture Device")
         case .display: String(localized: "Display Capture")
         case .image: String(localized: "Image")
+        case .video: String(localized: "Video File")
         }
     }
 

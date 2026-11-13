@@ -181,8 +181,13 @@ final class StudioController {
 
     func duplicate(_ scene: StudioScene) {
         let sources = scene.sources.map {
-            SceneSource(name: $0.name, input: $0.input, isVisible: $0.isVisible, layout: $0.layout, pipScale: $0.pipScale,
-                        isMirrored: $0.isMirrored, opacity: $0.opacity, filter: $0.filter, adjustments: $0.adjustments)
+            var copy = $0
+            copy = SceneSource(name: copy.name, input: copy.input, isVisible: copy.isVisible, layout: copy.layout,
+                               pipScale: copy.pipScale, isMirrored: copy.isMirrored, opacity: copy.opacity,
+                               filter: copy.filter, adjustments: copy.adjustments, shape: copy.shape,
+                               borderWidth: copy.borderWidth, borderColor: copy.borderColor,
+                               offsetX: copy.offsetX, offsetY: copy.offsetY)
+            return copy
         }
         scenes.append(StudioScene(name: String(localized: "\(scene.name) Copy"), sources: sources))
     }
@@ -218,9 +223,9 @@ final class StudioController {
     func canAdd(_ input: VideoSource) -> Bool {
         guard let scene = selectedScene else { return false }
         switch input {
-        case .camera: return scene.cameraSource == nil
+        case .camera(let id): return !scene.sources.contains { $0.input == .camera(id: id) }
         case .display: return scene.displaySource == nil
-        case .image: return true
+        case .image, .video: return true
         }
     }
 
@@ -228,7 +233,7 @@ final class StudioController {
         guard var scene = selectedScene else { return }
         guard canAdd(input) else {
             alertMessage = input.isCamera
-                ? String(localized: "This scene already has a camera. Remove it first, or add the other camera to a new scene.")
+                ? String(localized: "This camera is already in the scene. Add a different camera to show both.")
                 : String(localized: "This scene already has a display capture. Remove it first, or use a new scene.")
             return
         }
@@ -236,7 +241,19 @@ final class StudioController {
         var source = SceneSource(name: devices.name(for: input), input: input)
         switch input {
         case .camera:
-            source.layout = isEmpty ? .fit : .bottomRight
+            if scene.cameraSource == nil {
+                source.layout = isEmpty ? .fit : .bottomRight
+            } else {
+                // A second camera becomes a face cam: a small circle in the corner.
+                source.layout = .bottomRight
+                source.pipScale = 0.22
+                source.shape = .circle
+                source.borderWidth = 0.03
+            }
+        case .video:
+            source.layout = isEmpty ? .fit : .bottomLeft
+            source.pipScale = isEmpty ? 0.3 : 0.25
+            if !isEmpty { source.shape = .roundedRectangle }
         case .display:
             source.layout = .fit
         case .image:
@@ -256,6 +273,15 @@ final class StudioController {
         panel.message = String(localized: "Choose an image to add to this scene")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         addSource(.image(path: url.path(percentEncoded: false)))
+    }
+
+    func chooseVideoSource() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie]
+        panel.allowsMultipleSelection = false
+        panel.message = String(localized: "Choose a video to loop in this scene (it plays without sound)")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        addSource(.video(path: url.path(percentEncoded: false)))
     }
 
     func removeSource(_ id: UUID) {
@@ -511,13 +537,16 @@ final class StudioController {
         let sources = selectedScene?.sources ?? []
         let layers: [MediaPipeline.Layer] = sources.reversed().filter(\.isVisible).map { source in
             let input: MediaPipeline.Input = switch source.input {
-            case .camera: .camera
+            case .camera(let id): source.id == selectedScene?.cameraSource?.id ? .camera : .extraCamera(id)
             case .display: .display
             case .image(let path): .image(path)
+            case .video(let path): .video(path)
             }
             return MediaPipeline.Layer(input: input, layout: source.layout, pipScale: source.pipScale,
                                        isMirrored: source.isMirrored, opacity: source.opacity,
-                                       filter: source.filter, params: source.adjustments)
+                                       filter: source.filter, params: source.adjustments,
+                                       shape: source.shape, borderWidth: source.borderWidth,
+                                       borderColor: source.borderColor, offsetX: source.offsetX, offsetY: source.offsetY)
         }
         pipeline.updateVideo(.init(canvasWidth: resolution.width, canvasHeight: resolution.height,
                                    fps: frameRate.rawValue, layers: layers))
@@ -553,6 +582,7 @@ final class StudioController {
         var height: Int
         var fps: Int
         var showsCursor: Bool
+        var extraCameraIDs: [String] = []
     }
 
     private func reconfigureCapture(force: Bool = false) {
@@ -562,9 +592,12 @@ final class StudioController {
         if let source = scene?.cameraSource, case .camera(let id) = source.input { keyCameraID = id }
         var keyDisplayID: UInt32?
         if let source = scene?.displaySource, case .display(let id) = source.input { keyDisplayID = id }
+        let extraIDs: [String] = (scene?.extraCameraSources ?? []).filter(\.isVisible).compactMap {
+            if case .camera(let id) = $0.input { id } else { nil }
+        }
         let key = CaptureKey(cameraID: keyCameraID, microphoneID: audioSource(.microphone)?.deviceID, displayID: keyDisplayID,
                              desktopAudio: audioSource(.desktop) != nil, width: resolution.width, height: resolution.height,
-                             fps: frameRate.rawValue, showsCursor: showsCursor)
+                             fps: frameRate.rawValue, showsCursor: showsCursor, extraCameraIDs: extraIDs)
         guard force || key != lastCaptureKey else { return }
         lastCaptureKey = key
 
@@ -575,6 +608,9 @@ final class StudioController {
             pipeline.clearFrame(.camera)
             activeCameraID = cameraID
         }
+        var extraDevices: [String: AVCaptureDevice] = [:]
+        for id in extraIDs { if let device = devices.camera(id: id) { extraDevices[id] = device } }
+        pipeline.extraCameras.configure(devices: extraDevices, fps: frameRate.rawValue)
         let microphoneDevice = audioSource(.microphone).flatMap { devices.microphone(id: $0.deviceID) }
         pipeline.camera.configure(camera: cameraDevice, microphone: microphoneDevice,
                                   canvasWidth: resolution.width, canvasHeight: resolution.height, fps: frameRate.rawValue)

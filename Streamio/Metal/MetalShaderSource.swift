@@ -46,7 +46,50 @@ public struct MetalShaderSource {
         float uvHeight;
         uint mirror;
         float opacity;
+        // Shape mask: 0 box, 1 rounded box, 2 ellipse, 3 hexagon, 4 diamond.
+        uint shape;
+        // Size of the layer's viewport in pixels, for round corners and crisp edges.
+        float viewWidth;
+        float viewHeight;
+        // Border thickness as a fraction of the shorter side, and its colour.
+        float borderWidth;
+        float borderRed;
+        float borderGreen;
+        float borderBlue;
     };
+
+    // Signed distance to the shape, in units of the viewport's shorter side (negative inside).
+    float shapeDistance(float2 uv, constant ShaderParams &params) {
+        float minSide = max(min(params.viewWidth, params.viewHeight), 1.0);
+        float2 halfSize = float2(params.viewWidth, params.viewHeight) / minSide * 0.5;
+        float2 p = (uv - 0.5) * float2(params.viewWidth, params.viewHeight) / minSide;
+        switch (params.shape) {
+            case 1: { // rounded box
+                float r = 0.18;
+                float2 q = abs(p) - (halfSize - float2(r));
+                return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+            }
+            case 2: { // circle / ellipse
+                return (length(p / halfSize) - 1.0) * min(halfSize.x, halfSize.y);
+            }
+            case 3: { // hexagon, point sideways
+                float2 n = p / halfSize * 0.5;
+                const float3 k = float3(-0.866025404, 0.5, 0.577350269);
+                float2 a = abs(n);
+                a -= 2.0 * min(dot(k.xy, a), 0.0) * k.xy;
+                a -= float2(clamp(a.x, -k.z * 0.46, k.z * 0.46), 0.46);
+                return length(a) * sign(a.y) * min(halfSize.x, halfSize.y) * 2.0;
+            }
+            case 4: { // diamond
+                float2 n = p / halfSize * 0.5;
+                return (abs(n.x) + abs(n.y) - 0.5) * 0.70710678 * min(halfSize.x, halfSize.y) * 2.0;
+            }
+            default: { // box
+                float2 q = abs(p) - halfSize;
+                return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0);
+            }
+        }
+    }
 
     fragment float4 videoFragmentShader(VertexOut in [[stage_in]],
                                        texture2d<float, access::sample> texture [[texture(0)]],
@@ -128,6 +171,19 @@ public struct MetalShaderSource {
         
         float3 result = clamp(mix(rgb, filtered, params.intensity), 0.0, 1.0);
         float outAlpha = clamp(alpha * params.opacity, 0.0, 1.0);
+
+        // Cut to the shape with an anti-aliased edge, and paint the border band inside it.
+        if (params.shape != 0 || params.borderWidth > 0.0) {
+            float edge = 1.0 / max(min(params.viewWidth, params.viewHeight), 1.0);
+            float d = shapeDistance(uv, params);
+            float inside = clamp(0.5 - d / edge, 0.0, 1.0);
+            if (params.borderWidth > 0.0) {
+                float band = clamp(0.5 + (d + params.borderWidth) / edge, 0.0, 1.0);
+                result = mix(result, float3(params.borderRed, params.borderGreen, params.borderBlue), band);
+                outAlpha = mix(outAlpha, 1.0, band);
+            }
+            outAlpha *= inside;
+        }
         // Premultiplied output; the pipeline blends with (one, oneMinusSourceAlpha).
         return float4(result * outAlpha, outAlpha);
     }

@@ -50,3 +50,18 @@ precondition(AudioLevels.amplitude(fromDecibels: 20) > 9.99 && AudioLevels.ampli
 let facebook = StreamDestination(name: "Facebook", service: .facebook)
 precondition(facebook.serverURL.hasPrefix("rtmps://") && facebook.keychainAccount.hasPrefix("destination."), "destination")
 print("PROTOCOL_CHECKS_OK")
+
+// Face cam: a circle overlay is a centred square crop, nudges stay on the canvas, and two cameras
+// give the lowest layer as the main one.
+let face = CanvasPlacement.make(layout: .bottomRight, pipScale: 0.2, contentWidth: 1920, contentHeight: 1080,
+                                canvasWidth: 1920, canvasHeight: 1080, squareCrop: SourceShape.circle.cropsToSquare, offsetX: 0, offsetY: 0)
+precondition(face.width == face.height && face.width == 384 && abs(face.cropWidth - 0.5625) < 0.0001 && abs(face.cropX - 0.21875) < 0.0001, "face \(face)")
+let nudged = CanvasPlacement.make(layout: .bottomRight, pipScale: 0.2, contentWidth: 1920, contentHeight: 1080,
+                                  canvasWidth: 1920, canvasHeight: 1080, squareCrop: true, offsetX: 0.5, offsetY: 0.5)
+precondition(nudged.x + nudged.width <= 1920 && nudged.y + nudged.height <= 1080, "nudge \(nudged)")
+var twoCams = StudioScene(name: "Two")
+twoCams.sources = [SceneSource(name: "Face", input: .camera(id: "face"), shape: .circle), SceneSource(name: "Main", input: .camera(id: "main"))]
+precondition(twoCams.cameraSource?.name == "Main" && twoCams.extraCameraSources.map(\.name) == ["Face"], "two cameras")
+let legacy = #"{"id":"\#(UUID().uuidString)","name":"Old","input":{"image":{"path":"/x.png"}},"isVisible":true,"layout":"fit","pipScale":0.3,"isMirrored":false,"opacity":1,"filter":"passthrough","adjustments":{"brightness":0,"contrast":1,"saturation":1,"intensity":1}}"#
+let old = try! JSONDecoder().decode(SceneSource.self, from: Data(legacy.utf8))
+precondition(old.shape == .rectangle && old.borderWidth == 0, "legacy source")

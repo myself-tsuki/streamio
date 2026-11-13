@@ -42,6 +42,35 @@ nonisolated public struct CanvasPlacement: Equatable, Sendable {
         return CanvasPlacement(x: (target.0 - width) / 2, y: (target.1 - height) / 2, width: width, height: height)
     }
 
+    /// Placement plus the overlay options: a square crop for square-ish shapes and a nudge.
+    public static func make(layout: SourceLayout, pipScale: Double, contentWidth: Int, contentHeight: Int,
+                            canvasWidth: Int, canvasHeight: Int, squareCrop: Bool, offsetX: Double, offsetY: Double) -> CanvasPlacement {
+        var placement = make(layout: layout, pipScale: pipScale, contentWidth: contentWidth, contentHeight: contentHeight,
+                             canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+        let canvasW = Double(max(canvasWidth, 1)), canvasH = Double(max(canvasHeight, 1))
+        if squareCrop, layout.isPictureInPicture {
+            let sourceAspect = Double(max(contentWidth, 1)) / Double(max(contentHeight, 1))
+            let scale = min(max(pipScale, 0.05), 1)
+            let side = min(canvasW * scale, canvasH * min(1, scale * 1.8))
+            let margin = canvasW * 0.025
+            let left = layout == .topLeft || layout == .bottomLeft
+            let top = layout == .topLeft || layout == .topRight
+            placement = CanvasPlacement(x: left ? margin : canvasW - margin - side, y: top ? margin : canvasH - margin - side,
+                                        width: side, height: side)
+            if sourceAspect > 1 {
+                placement.cropWidth = Float(1 / sourceAspect)
+                placement.cropX = (1 - placement.cropWidth) / 2
+            } else {
+                placement.cropHeight = Float(sourceAspect)
+                placement.cropY = (1 - placement.cropHeight) / 2
+            }
+        }
+        // The nudge may not push the overlay off the canvas.
+        placement.x = min(max(placement.x + offsetX * canvasW, 0), max(0, canvasW - placement.width))
+        placement.y = min(max(placement.y + offsetY * canvasH, 0), max(0, canvasH - placement.height))
+        return placement
+    }
+
     public static func make(layout: SourceLayout, pipScale: Double, contentWidth: Int, contentHeight: Int,
                             canvasWidth: Int, canvasHeight: Int) -> CanvasPlacement {
         let sourceWidth = Double(max(contentWidth, 1)), sourceHeight = Double(max(contentHeight, 1))
