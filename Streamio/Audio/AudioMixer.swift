@@ -58,12 +58,27 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
     private var rings: [AudioChannelID: AudioRingBuffer] = [:]
     private var settings: [AudioChannelID: ChannelSettings] = [:]
     private var converters: [AudioChannelID: AVAudioConverter] = [:]
-    private var lastDelivery: [AudioChannelID: Double] = [:]
+    /// Host time each channel last delivered audio.
+    private var lastArrival: [AudioChannelID: Double] = [:]
     private var meters: [AudioChannelID: MeterAccumulator] = [:]
     private var lastMeterPublish: Double = 0
     private let meterInterval: Double = 1.0 / 20.0
-    /// Non-clock sources may run this far ahead before old audio is trimmed (100 ms).
-    private let maxLatencyFrames = 4_800
+
+    // The mix runs on its own steady clock, like OBS: sources only fill their ring buffers and a
+    // timer pulls one 1024-frame chunk from each every 21.3 ms. A source that stalls, switches or
+    // arrives in bursts can therefore never leave a hole in (or reorder) the stream's audio.
+    private let mixQueue = DispatchQueue(label: "com.streamio.mixer.clock", qos: .userInteractive)
+    private var mixTimer: DispatchSourceTimer?
+    private let chunkFrames = 1_024
+    /// A channel starts playing once this much is buffered (32 ms), so bursty delivery never underruns.
+    private let primeFrames = 1_536
+    /// More than this queued (150 ms) means the source runs fast; trim back to the cushion.
+    private let maxBufferedFrames = 7_200
+    /// Audio is stamped a little early to account for the cushion and device latency (A/V sync).
+    private let latencyCompensation = 0.04
+    private var primed: [AudioChannelID: Bool] = [:]
+    private var timelineStart: Double?
+    private var emittedFrames: Int64 = 0
 
     public init() {
         guard let format = AVAudioFormat(standardFormatWithSampleRate: Self.sampleRate, channels: Self.channelCount) else {
@@ -74,59 +89,43 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
             rings[channel] = AudioRingBuffer(capacity: Int(Self.sampleRate) / 2)
             settings[channel] = ChannelSettings()
         }
-        startSilenceClock()
+        startMixClock()
     }
-
-    // MARK: - Silence fallback
-
-    // If the microphone and desktop audio both stop delivering (cable pulled), nothing would clock
-    // the mix and the stream and recording would lose their audio track mid-way. This timer keeps
-    // emitting silence until a real source is back.
-    private let silenceQueue = DispatchQueue(label: "com.streamio.mixer.silence", qos: .userInteractive)
-    private var silenceTimer: DispatchSourceTimer?
-    private var lastArrival: [AudioChannelID: Double] = [:]
-    private var syntheticNext: Double?
-    private var silenceTicks = 0
-    private let silenceChunk = 1_024
-    private let sourceTimeout = 0.3
 
     private static func hostSeconds() -> Double {
         CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
     }
 
-    private func startSilenceClock() {
-        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: silenceQueue)
-        let interval = Double(silenceChunk) / Self.sampleRate
-        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(2))
-        timer.setEventHandler { [weak self] in self?.fillGap() }
+    private func startMixClock() {
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: mixQueue)
+        let interval = Double(chunkFrames) / Self.sampleRate / 2
+        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.mixTick() }
         timer.resume()
-        silenceTimer = timer
+        mixTimer = timer
     }
 
-    private func fillGap() {
+    /// Emits every chunk that is due on the wall clock, so a late tick catches up exactly.
+    private func mixTick() {
         lock.lock()
         defer { lock.unlock() }
         let now = Self.hostSeconds()
-        let hasLiveSource = AudioChannelID.allCases.contains { channel in
-            lastArrival[channel].map { now - $0 < sourceTimeout } ?? false
+        let start = timelineStart ?? now
+        timelineStart = start
+        var due = Int64((now - start) * Self.sampleRate) - emittedFrames
+        if due > Int64(Self.sampleRate / 4) {
+            // The Mac slept or the process stalled for a while: restart the timeline instead of flooding.
+            timelineStart = now
+            emittedFrames = 0
+            due = 0
         }
-        guard !hasLiveSource else {
-            syntheticNext = nil
-            return
+        while due >= Int64(chunkFrames) {
+            let time = (timelineStart ?? now) + Double(emittedFrames) / Self.sampleRate - latencyCompensation
+            emitMix(frames: chunkFrames, time: time)
+            emittedFrames += Int64(chunkFrames)
+            due -= Int64(chunkFrames)
         }
-        let time: Double
-        if let next = syntheticNext, abs(now - next) < 0.2 { time = next } else { time = now }
-        syntheticNext = time + Double(silenceChunk) / Self.sampleRate
-        emitMix(frames: silenceChunk, time: time)
-
-        // Meters would otherwise freeze at their last reading.
-        silenceTicks += 1
-        if silenceTicks % 5 == 0 {
-            meters.removeAll(keepingCapacity: true)
-            var readings: [AudioChannelID: AudioLevels] = [:]
-            for channel in AudioChannelID.allCases { readings[channel] = .silent }
-            onLevels?(readings)
-        }
+        publishMetersIfNeeded(now: now)
     }
 
     public func setSettings(_ newSettings: ChannelSettings, for channel: AudioChannelID) {
@@ -138,8 +137,8 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         lock.withLock {
             rings[channel]?.removeAll()
             converters[channel] = nil
-            lastDelivery[channel] = nil
             lastArrival[channel] = nil
+            primed[channel] = false
             meters[channel] = nil
         }
     }
@@ -149,7 +148,6 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
     public func ingest(_ sampleBuffer: CMSampleBuffer, from channel: AudioChannelID) {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let pcm = Self.makePCMBuffer(from: sampleBuffer, formatDescription: formatDescription) else { return }
-        let time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
 
         lock.lock()
         defer { lock.unlock() }
@@ -182,24 +180,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
             rings[channel]?.write(left: UnsafeBufferPointer(start: left, count: frames),
                                   right: UnsafeBufferPointer(start: right, count: frames))
         }
-        lastDelivery[channel] = time
         lastArrival[channel] = Self.hostSeconds()
-
-        if channel == clockChannel(now: time) {
-            emitMix(frames: frames, time: time)
-        }
-        publishMetersIfNeeded(now: time)
-    }
-
-    /// The first microphone drives the mix while it is delivering; then the second input; then desktop audio.
-    private func clockChannel(now: Double) -> AudioChannelID {
-        if let micTime = lastDelivery[.microphone], now - micTime < 0.5 {
-            return .microphone
-        }
-        if let auxTime = lastDelivery[.aux], now - auxTime < 0.5 {
-            return .aux
-        }
-        return .desktop
     }
 
     private func emitMix(frames: Int, time: Double) {
@@ -214,9 +195,18 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         let rightBuffer = UnsafeMutableBufferPointer(start: outRight, count: frames)
         for channel in AudioChannelID.allCases {
             // Mutate in place: copying a ring out of the dictionary would copy its storage.
-            guard let available = rings[channel]?.availableFrames else { continue }
-            if available > frames + maxLatencyFrames {
-                rings[channel]?.skip(available - frames - maxLatencyFrames / 2)
+            guard var available = rings[channel]?.availableFrames else { continue }
+            if primed[channel] != true {
+                guard available >= primeFrames else { continue }
+                primed[channel] = true
+            }
+            if available > maxBufferedFrames {
+                rings[channel]?.skip(available - primeFrames)
+                available = primeFrames
+            }
+            if available < frames {
+                // Underrun: play what there is, then wait for the cushion to refill.
+                primed[channel] = false
             }
             rings[channel]?.mix(into: leftBuffer, rightBuffer, count: frames, gain: 1)
         }
@@ -257,7 +247,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         var readings: [AudioChannelID: AudioLevels] = [:]
         for channel in AudioChannelID.allCases {
             guard let accumulator = meters[channel], accumulator.frames > 0,
-                  let delivered = lastDelivery[channel], now - delivered < 0.5 else {
+                  let delivered = lastArrival[channel], now - delivered < 0.5 else {
                 readings[channel] = .silent
                 continue
             }

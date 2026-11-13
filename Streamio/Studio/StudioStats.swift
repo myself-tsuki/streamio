@@ -24,6 +24,10 @@ final class StudioStats {
     var bitrateKbps: Double = 0
     var bytesSent: UInt64 = 0
     var congestion: Double = 0
+    /// Seconds of video waiting in the send buffer (worst destination).
+    var bufferSeconds: Double = 0
+    /// Share of the set bitrate the encoder is using while adapting to a weak link (lowest destination).
+    var adaptiveFactor: Double = 1
     var network: [UUID: RTMPClient.Statistics] = [:]
     var cpuPercent: Double = 0
     var gpuPercent: Double?
@@ -47,5 +51,7 @@ final class StudioStats {
         droppedFrames = values.reduce(0) { $0 + $1.droppedVideoFrames }
         sentFrames = values.reduce(0) { $0 + $1.sentVideoFrames }
         congestion = values.map(\.congestion).max() ?? 0
+        bufferSeconds = values.map(\.bufferSeconds).max() ?? 0
+        adaptiveFactor = values.map(\.adaptiveFactor).min() ?? 1
     }
 }

@@ -225,6 +225,7 @@ struct AdvancedSettingsPane: View {
         @Bindable var studio = studio
         Form {
             Toggle("Reconnect Automatically", isOn: $studio.autoReconnect)
+            Toggle("Adaptive Bitrate (keep the stream smooth on a weak connection)", isOn: $studio.adaptiveBitrate)
             LabeledContent("Keyframe Interval") {
                 Stepper(value: $studio.keyFrameInterval, in: 1...10, step: 1) {
                     Text("\(Int(studio.keyFrameInterval)) s")

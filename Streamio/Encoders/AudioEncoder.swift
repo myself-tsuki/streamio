@@ -78,10 +78,12 @@ nonisolated public final class AudioEncoder: @unchecked Sendable {
                   let right = buffer.floatChannelData?[buffer.format.channelCount > 1 ? 1 : 0] else { return }
             let frames = Int(buffer.frameLength)
 
-            // Resynchronise if the incoming time drifts more than 50 ms from the FIFO's clock.
+            // Timestamps follow the sample count, so they stay perfectly even. Only a real jump
+            // (over 250 ms: a stall or a restart) moves the clock; smaller jitter must not, or
+            // every nudge becomes an audible glitch in the stream.
             let sampleRate = inputFormat.sampleRate
             let expected = (fifoTime ?? time) + Double(fifo.availableFrames) / sampleRate
-            if fifoTime == nil || abs(expected - time) > 0.05 {
+            if fifoTime == nil || abs(expected - time) > 0.25 {
                 fifoTime = time - Double(fifo.availableFrames) / sampleRate
             }
 

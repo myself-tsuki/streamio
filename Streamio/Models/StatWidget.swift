@@ -10,7 +10,7 @@
 import Foundation
 
 nonisolated enum StatMetric: String, Codable, CaseIterable, Identifiable, Sendable {
-    case live, rec, fps, cameraFPS, render, cpu, gpu, memory, bitrate, dropped, disk, ping, microphone
+    case live, rec, fps, cameraFPS, render, cpu, gpu, memory, bitrate, dropped, disk, ping, microphone, buffer
 
     var id: String { rawValue }
 
@@ -29,6 +29,7 @@ nonisolated enum StatMetric: String, Codable, CaseIterable, Identifiable, Sendab
         case .disk: "Free disk"
         case .ping: "Ping"
         case .microphone: "Microphone level"
+        case .buffer: "Send buffer"
         }
     }
 
@@ -47,6 +48,7 @@ nonisolated enum StatMetric: String, Codable, CaseIterable, Identifiable, Sendab
         case .disk: "internaldrive"
         case .ping: "network"
         case .microphone: "mic.fill"
+        case .buffer: "tray.full"
         }
     }
 

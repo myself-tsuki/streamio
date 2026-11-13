@@ -117,14 +117,16 @@ extension StudioController {
         case .bitrate:
             // The safe range follows the bitrate you set, times the destinations that are on air.
             let active = max(1, destinations.filter { status(of: $0.id).isActive }.count)
-            let target = videoBitrateKbps * Double(active)
+            let fullTarget = videoBitrateKbps * Double(active)
+            // While adaptive bitrate is easing off for a weak link, judge against what it asks for.
+            let target = fullTarget * stats.adaptiveFactor
             let kbps = stats.bitrateKbps
             let warmedUp = stats.streamStart.map { now.timeIntervalSince($0) > 8 } ?? false
             return StatReading(
                 title: "Bitrate", symbol: metric.symbol,
                 value: kbps >= 10_000 ? String(format: "%.1f", kbps / 1000) : String(format: "%.0f", kbps),
                 unit: kbps >= 10_000 ? "Mb/s" : "kb/s", number: kbps,
-                scale: .nice(upTo: target * 1.6, labelDivisor: 1000, caption: "×1000 kb/s"),
+                scale: .nice(upTo: fullTarget * 1.6, labelDivisor: 1000, caption: stats.adaptiveFactor < 0.99 ? "adapting ×1000" : "×1000 kb/s"),
                 zones: zones([(0, Theme.zoneDanger, "LOW"), (target * 0.6, Theme.zoneCaution, "DIP"),
                               (target * 0.8, Theme.zoneNormal, "OK"), (target * 1.3, Theme.zoneHigh, "HIGH")]),
                 isIdle: !streamStatus.isActive,
@@ -145,6 +147,12 @@ extension StudioController {
                                unit: ping == nil ? "" : "ms", number: ping ?? 0, scale: .nice(upTo: 250, maxMajors: 5, caption: "ms"),
                                zones: zones([(0, Theme.zoneNormal, "OK"), (100, Theme.zoneCaution, "SLOW"), (180, Theme.zoneDanger, "HIGH")]),
                                isIdle: ping == nil)
+        case .buffer:
+            let seconds = stats.bufferSeconds
+            return StatReading(title: "Buffer", symbol: metric.symbol, value: String(format: "%.1f", seconds), unit: "s",
+                               number: seconds, scale: .nice(upTo: 8, maxMajors: 8, caption: "seconds queued"),
+                               zones: zones([(0, Theme.zoneNormal, "OK"), (1.5, Theme.zoneCaution, "BUILDING"), (5, Theme.zoneDanger, "FULL")]),
+                               isIdle: !streamStatus.isActive, isAlert: streamStatus.isActive && seconds >= 6)
         case .microphone:
             return StatReading(title: "Microphone", symbol: metric.symbol, value: "")
         }

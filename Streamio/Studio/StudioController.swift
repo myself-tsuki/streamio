@@ -39,6 +39,14 @@ final class StudioController {
             ? defaultRecordingDirectory : url
     }
     var autoReconnect = true { didSet { save() } }
+    /// Lowers the video bitrate while the connection is weak and restores it when it recovers, so the
+    /// stream stays smooth instead of dropping frames.
+    var adaptiveBitrate = UserDefaults.standard.object(forKey: "studio.adaptiveBitrate") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(adaptiveBitrate, forKey: "studio.adaptiveBitrate")
+            pipeline.setAdaptiveBitrate(adaptiveBitrate)
+        }
+    }
     var showsCursor = true { didSet { save(); reconfigureCapture() } }
     /// Mixer channels the user added. Empty by default: nothing is captured until a source is added.
     var audioSources: [AudioSourceConfig] = [] {
@@ -132,6 +140,7 @@ final class StudioController {
         isLoading = false
         save()
 
+        pipeline.setAdaptiveBitrate(adaptiveBitrate)
         pipeline.onEvent = { [weak self] event in
             Task { @MainActor in self?.handle(event) }
         }

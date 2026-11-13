@@ -91,6 +91,10 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
     private let lock = NSLock()
     private var video = VideoState()
     private var clients: [UUID: RTMPClient] = [:]
+    /// Configured encoder bitrate, and the adaptive share each destination currently asks for.
+    private var baseBitrate = 0
+    private var adaptiveFactors: [UUID: Double] = [:]
+    private var adaptiveEnabled = true
     private var isRecording = false
     private var frames: [Input: SourceFrame] = [:]
     private var images: [String: CVPixelBuffer] = [:]
@@ -258,6 +262,8 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
 
         let client = RTMPClient()
         client.onKeyFrameRequest = { [weak self] in self?.videoEncoder.requestKeyFrame() }
+        client.onBitrateAdvice = { [weak self] factor in self?.setAdaptiveFactor(factor, for: id) }
+        client.isAdaptive = lock.withLock { adaptiveEnabled }
         client.onEvent = { [weak self] event in
             switch event {
             case .status(let status): self?.onEvent?(.stream(id, status))
@@ -279,10 +285,12 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
 
     func stopDestination(_ id: UUID) {
         let (client, remaining) = lock.withLock { () -> (RTMPClient?, Int) in
+            adaptiveFactors[id] = nil
             let removed = clients.removeValue(forKey: id)
             return (removed, clients.count)
         }
         client?.disconnect()
+        applyEffectiveBitrate()
         if remaining == 0 {
             audioEncoder.stop()
             lock.withLock { audioSequenceHeader = nil }
@@ -310,10 +318,35 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
     }
 
     func updateBitrate(_ bitrate: Int) {
-        videoEncoder.updateBitrate(bitrate)
+        lock.withLock { baseBitrate = bitrate }
+        applyEffectiveBitrate()
+    }
+
+    /// Turns adaptive bitrate on or off for every destination.
+    func setAdaptiveBitrate(_ enabled: Bool) {
+        let targets = lock.withLock { () -> [RTMPClient] in
+            adaptiveEnabled = enabled
+            if !enabled { adaptiveFactors.removeAll() }
+            return Array(clients.values)
+        }
+        for client in targets { client.isAdaptive = enabled }
+        applyEffectiveBitrate()
+    }
+
+    private func setAdaptiveFactor(_ factor: Double, for id: UUID) {
+        lock.withLock { adaptiveFactors[id] = factor }
+        applyEffectiveBitrate()
+    }
+
+    /// One encoder feeds every destination, so it follows the weakest link.
+    private func applyEffectiveBitrate() {
+        let (base, factor) = lock.withLock { (baseBitrate, adaptiveEnabled ? (adaptiveFactors.values.min() ?? 1) : 1) }
+        guard base > 0 else { return }
+        videoEncoder.updateBitrate(Int(Double(base) * factor))
     }
 
     private func ensureEncoder(_ settings: VideoEncoder.Settings) throws {
+        lock.withLock { baseBitrate = settings.bitrate }
         if !videoEncoder.isRunning {
             lock.withLock { videoSequenceHeader = nil }
             try videoEncoder.start(settings)

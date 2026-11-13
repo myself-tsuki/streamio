@@ -53,6 +53,10 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
         public var droppedVideoFrames = 0
         /// 0 = socket keeping up, 1 = send buffer at its drop threshold.
         public var congestion: Double = 0
+        /// Seconds of video waiting to be sent (the jitter buffer's fill level).
+        public var bufferSeconds: Double = 0
+        /// 1 = full bitrate; lower while adaptive bitrate is easing off for a weak link.
+        public var adaptiveFactor: Double = 1
     }
 
     public enum Event: Sendable {
@@ -73,6 +77,16 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
     public var onEvent: (@Sendable (Event) -> Void)?
     /// Asks the video encoder for an IDR frame (stream start, after drops).
     public var onKeyFrameRequest: (@Sendable () -> Void)?
+    /// Adaptive bitrate: the share (0.25 … 1) of the configured bitrate the link can carry now.
+    public var onBitrateAdvice: (@Sendable (Double) -> Void)?
+    /// Lower the encoder bitrate when the send buffer fills, raise it again when the link recovers.
+    public var isAdaptive: Bool {
+        get { queue.sync { adaptive } }
+        set { queue.async { [self] in
+            adaptive = newValue
+            if !newValue, adaptiveFactor != 1 { adaptiveFactor = 1; stats.adaptiveFactor = 1; onBitrateAdvice?(1) }
+        } }
+    }
 
     private let queue = DispatchQueue(label: "com.streamio.rtmp", qos: .userInitiated)
 
@@ -106,6 +120,25 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
 
     // Flow control and statistics
     private var bytesInFlight = 0
+
+    /// Media waiting for the socket. Holding a few seconds here (instead of letting the OS queue
+    /// grow unseen) rides out a short outage without dropping a frame, and lets us jump to the
+    /// newest keyframe if the outage is longer than the buffer.
+    private struct PendingMessage {
+        var type: RTMPMessageType
+        var csid: UInt32
+        var timestamp: UInt32
+        var payload: Data
+        var isVideo: Bool
+    }
+    private var pending: [PendingMessage] = []
+    private var pendingHead = 0
+    private var pendingBytes = 0
+    private var adaptive = true
+    private var adaptiveFactor = 1.0
+    private var calmTicks = 0
+    private var cutCooldown = 0
+    private var adaptTimer: DispatchSourceTimer?
     private var stats = Statistics()
     private var lastStatsBytes: UInt64 = 0
     private var lastStatsTime = ContinuousClock.now
@@ -114,6 +147,7 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
     public init() {}
 
     deinit {
+        adaptTimer?.cancel()
         statsTimer?.cancel()
         connection?.cancel()
     }
@@ -126,6 +160,9 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
             userRequestedStop = false
             reconnectAttempts = 0
             stats = Statistics()
+            adaptiveFactor = 1
+            calmTicks = 0
+            cutCooldown = 0
             lastStatsBytes = 0
             openConnection()
             startStatsTimer()
@@ -138,6 +175,8 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
             closeConnection(sendingUnpublish: phase == .live)
             statsTimer?.cancel()
             statsTimer = nil
+            adaptTimer?.cancel()
+            adaptTimer = nil
             setStatus(.idle)
         }
     }
@@ -174,14 +213,20 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
                 stats.droppedVideoFrames += 1
                 return
             }
-            if bytesInFlight > dropThreshold, !isKeyFrame {
-                // Socket can't keep up: skip until the next IDR so the decoder never sees a broken GOP.
-                stats.droppedVideoFrames += 1
-                if !waitingForKeyFrame {
-                    waitingForKeyFrame = true
-                    onKeyFrameRequest?()
+            let backlog = pendingBytes + bytesInFlight
+            if backlog > bufferLimit {
+                if isKeyFrame {
+                    // Longer outage than the buffer holds: skip the stale video and resume from this
+                    // keyframe. Audio stays, so sound never has a hole.
+                    discardPendingVideo()
+                } else {
+                    stats.droppedVideoFrames += 1
+                    if !waitingForKeyFrame {
+                        waitingForKeyFrame = true
+                        onKeyFrameRequest?()
+                    }
+                    return
                 }
-                return
             }
             waitingForKeyFrame = false
 
@@ -189,7 +234,7 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
             let composition = Int32(((pts - dts) * 1000).rounded())
             let tag = FLVTag.videoFrame(format: configuration.videoFormat, accessUnit: accessUnit,
                                         isKeyFrame: isKeyFrame, compositionTimeMs: composition)
-            sendMessage(type: .video, csid: RTMPChunkStream.video, timestamp: timestamp, payload: tag)
+            enqueue(PendingMessage(type: .video, csid: RTMPChunkStream.video, timestamp: timestamp, payload: tag, isVideo: true))
             stats.sentVideoFrames += 1
         }
     }
@@ -197,21 +242,63 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
     public func sendAudio(aacPacket: Data, pts: Double) {
         queue.async { [self] in
             guard phase == .live else { return }
-            // Audio is tiny; only shed it when the socket is hopelessly behind.
-            guard bytesInFlight < dropThreshold * 4 else { return }
+            // Audio is never shed to relieve a slow link (it is a few kb/s); only a runaway queue stops it.
+            guard pendingBytes < 64 * 1024 * 1024 else { return }
             let timestamp = mediaTimestamp(for: pts, last: &lastAudioTimestamp)
-            sendMessage(type: .audio, csid: RTMPChunkStream.audio, timestamp: timestamp,
-                        payload: FLVTag.makeAACPacket(aacData: aacPacket))
+            enqueue(PendingMessage(type: .audio, csid: RTMPChunkStream.audio, timestamp: timestamp,
+                                   payload: FLVTag.makeAACPacket(aacData: aacPacket), isVideo: false))
         }
+    }
+
+    private func enqueue(_ message: PendingMessage) {
+        pending.append(message)
+        pendingBytes += message.payload.count
+        pump()
+    }
+
+    /// Hands queued media to the socket while little is in flight, so the queue (not the OS) holds the backlog.
+    private func pump() {
+        while pendingHead < pending.count, bytesInFlight < pumpWindow {
+            let item = pending[pendingHead]
+            pendingHead += 1
+            pendingBytes -= item.payload.count
+            sendMessage(type: item.type, csid: item.csid, timestamp: item.timestamp, payload: item.payload)
+        }
+        if pendingHead > 512 || pendingHead == pending.count {
+            pending.removeFirst(pendingHead)
+            pendingHead = 0
+        }
+    }
+
+    private func discardPendingVideo() {
+        var kept: [PendingMessage] = []
+        var removed = 0
+        for item in pending[pendingHead...] {
+            if item.isVideo { removed += 1 } else { kept.append(item) }
+        }
+        pending = kept
+        pendingHead = 0
+        pendingBytes = kept.reduce(0) { $0 + $1.payload.count }
+        stats.droppedVideoFrames += removed
+    }
+
+    private func clearPending() {
+        pending.removeAll()
+        pendingHead = 0
+        pendingBytes = 0
     }
 
     // MARK: - Connection lifecycle
 
-    private var dropThreshold: Int {
-        let bitrate = configuration?.videoBitrate ?? 4_500_000
-        // About two seconds of video may sit in the send buffer before we start dropping.
-        return max(512 * 1024, bitrate / 8 * 2)
+    private var bytesPerSecond: Double {
+        Double(max(configuration?.videoBitrate ?? 4_500_000, 500_000)) / 8
     }
+
+    /// Up to eight seconds of video may wait for a weak link before frames are dropped.
+    private var bufferLimit: Int { max(1_000_000, Int(bytesPerSecond * 8)) }
+
+    /// How much may be in the socket at once; the rest waits in `pending` where we can manage it.
+    private var pumpWindow: Int { max(128 * 1024, Int(bytesPerSecond * 0.25)) }
 
     private func openConnection() {
         guard let configuration else { return }
@@ -223,6 +310,7 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
         reader = RTMPChunkReader()
         handshakeBuffer = Data()
         bytesInFlight = 0
+        clearPending()
         bytesReceived = 0
         lastAcknowledged = 0
         nextTransactionID = 1
@@ -568,6 +656,7 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
         connection.send(content: data, completion: .contentProcessed { [weak self] error in
             guard let self, currentGeneration == self.generation else { return }
             self.bytesInFlight -= count
+            self.pump()
             if let error {
                 self.connectionLost("Send failed: \(error.localizedDescription)")
             } else {
@@ -595,7 +684,42 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
 
     // MARK: - Statistics
 
+    /// Four times a second: if more than ~1 s of video is waiting, ask for a lower bitrate (cut fast);
+    /// after a few calm seconds, creep back up (recover slowly) so the picture does not oscillate.
+    private func adaptBitrate() {
+        guard adaptive, phase == .live else { return }
+        let seconds = Double(pendingBytes + bytesInFlight) / bytesPerSecond
+        let floor = max(0.25, min(1, 1_500_000 / Double(max(configuration?.videoBitrate ?? 1, 1))))
+        var next = adaptiveFactor
+        if cutCooldown > 0 { cutCooldown -= 1 }
+        if seconds > 1.0 {
+            calmTicks = 0
+            if cutCooldown == 0 {
+                next = max(floor, adaptiveFactor * 0.65)
+                cutCooldown = 4
+            }
+        } else if seconds < 0.35 {
+            calmTicks += 1
+            if calmTicks >= 12 {
+                next = min(1, adaptiveFactor + 0.08)
+                calmTicks = 8
+            }
+        } else {
+            calmTicks = 0
+        }
+        if abs(next - adaptiveFactor) > 0.001 {
+            adaptiveFactor = next
+            onBitrateAdvice?(next)
+        }
+    }
+
     private func startStatsTimer() {
+        adaptTimer?.cancel()
+        let adapt = DispatchSource.makeTimerSource(queue: queue)
+        adapt.schedule(deadline: .now() + 0.25, repeating: 0.25)
+        adapt.setEventHandler { [weak self] in self?.adaptBitrate() }
+        adapt.resume()
+        adaptTimer = adapt
         statsTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
@@ -612,7 +736,10 @@ nonisolated public final class RTMPClient: @unchecked Sendable {
         let seconds = max(0.001, Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18)
         let delta = stats.bytesSent - lastStatsBytes
         stats.bitrateKbps = Double(delta) * 8 / seconds / 1000
-        stats.congestion = min(1, Double(bytesInFlight) / Double(dropThreshold))
+        let backlog = pendingBytes + bytesInFlight
+        stats.congestion = min(1, Double(backlog) / Double(bufferLimit))
+        stats.bufferSeconds = Double(backlog) / bytesPerSecond
+        stats.adaptiveFactor = adaptiveFactor
         lastStatsBytes = stats.bytesSent
         lastStatsTime = now
         onEvent?(.statistics(stats))
