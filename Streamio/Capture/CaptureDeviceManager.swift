@@ -48,7 +48,7 @@ final class CaptureDeviceManager {
             DeviceItem(id: $0.uniqueID, name: $0.localizedName, isDefault: $0.uniqueID == defaultCamera)
         }
 
-        let audioDiscovery = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone], mediaType: .audio, position: .unspecified)
+        let audioDiscovery = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external], mediaType: .audio, position: .unspecified)
         let defaultMicrophone = AVCaptureDevice.default(for: .audio)?.uniqueID
         microphones = audioDiscovery.devices.map {
             DeviceItem(id: $0.uniqueID, name: $0.localizedName, isDefault: $0.uniqueID == defaultMicrophone)

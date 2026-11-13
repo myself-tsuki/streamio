@@ -13,6 +13,7 @@ import SwiftUI
 struct StudioView: View {
     @Environment(StudioController.self) private var studio
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
     @State private var showsSidebar = true
     @State private var showsCustomizer = false
 
@@ -89,11 +90,17 @@ struct StudioView: View {
                         WidgetCustomizer(initialTab: .bar).environment(studio)
                     }
                     .help("Choose what the bottom bar and the preview widgets show")
-                Button("Pop Out Preview", systemImage: "rectangle.on.rectangle") {
-                    openWindow(id: "program")
-                    studio.moveProgramWindowToOtherScreen()
+                Button(studio.isProgramPoppedOut ? "Bring Preview Back" : "Pop Out Preview",
+                       systemImage: studio.isProgramPoppedOut ? "arrow.uturn.backward" : "rectangle.on.rectangle") {
+                    if studio.isProgramPoppedOut {
+                        dismissWindow(id: "program")
+                    } else {
+                        openWindow(id: "program")
+                        studio.moveProgramWindowToOtherScreen()
+                    }
                 }
-                .help("Open the program output in its own window, for a second display")
+                .help(studio.isProgramPoppedOut ? "Put the preview back in this window"
+                                                : "Open the program output in its own window, for a second display")
                 Button("Fullscreen Preview", systemImage: "arrow.up.left.and.arrow.down.right") {
                     studio.setFullscreenPreview(true)
                 }
@@ -107,8 +114,35 @@ struct StudioView: View {
 
 struct PreviewPane: View {
     @Environment(StudioController.self) private var studio
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
+        if studio.isProgramPoppedOut {
+            poppedOutPlaceholder
+        } else {
+            programPane
+        }
+    }
+
+    /// The video is in its own window; this is the way back.
+    private var poppedOutPlaceholder: some View {
+        VStack(spacing: Theme.spacingM) {
+            Image(systemName: "rectangle.on.rectangle")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text("The preview is in its own window")
+                .font(.title3.weight(.semibold))
+            Button("Bring Preview Back", systemImage: "arrow.uturn.backward") {
+                dismissWindow(id: "program")
+            }
+            .buttonStyle(.glassProminent)
+            .controlSize(.large)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .glassEffect(.regular, in: .rect(cornerRadius: Theme.previewRadius))
+    }
+
+    private var programPane: some View {
         ProgramView(cornerRadius: Theme.previewRadius) { studio.setFullscreenPreview(true) }
             .overlay {
                 if let scene = studio.selectedScene, !scene.sources.contains(where: \.isVisible) {
@@ -163,14 +197,15 @@ struct SourceWarnings: View {
 
     var body: some View {
         let missing = (studio.selectedScene?.sources ?? []).filter { $0.isVisible && !studio.devices.isConnected($0.input) }
-        let micMissing = studio.isAudioDeviceMissing(.microphone)
+        let missingInputs = StudioController.inputChannels.filter { studio.isAudioDeviceMissing($0) }
+        let micMissing = !missingInputs.isEmpty
         if !missing.isEmpty || micMissing || studio.captureNotice != nil {
             VStack(alignment: .leading, spacing: Theme.spacingXS) {
                 ForEach(missing) { source in
                     Label("\(source.name) is disconnected. Waiting for this device.", systemImage: "exclamationmark.triangle.fill")
                 }
-                if micMissing {
-                    Label("\(studio.audioTitle(.microphone)) is disconnected. Waiting for this device.", systemImage: "mic.slash.fill")
+                ForEach(missingInputs) { channel in
+                    Label("\(studio.audioTitle(channel)) is disconnected. Waiting for this device.", systemImage: "mic.slash.fill")
                 }
                 if !missing.isEmpty || micMissing, studio.isOutputActive {
                     Text("The broadcast keeps running and shows \u{201C}No signal\u{201D} until the device is back.")

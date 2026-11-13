@@ -191,10 +191,13 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         publishMetersIfNeeded(now: time)
     }
 
-    /// The microphone drives the mix while it is delivering; otherwise desktop audio does.
+    /// The first microphone drives the mix while it is delivering; then the second input; then desktop audio.
     private func clockChannel(now: Double) -> AudioChannelID {
         if let micTime = lastDelivery[.microphone], now - micTime < 0.5 {
             return .microphone
+        }
+        if let auxTime = lastDelivery[.aux], now - auxTime < 0.5 {
+            return .aux
         }
         return .desktop
     }

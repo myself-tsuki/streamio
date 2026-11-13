@@ -12,6 +12,7 @@ struct StreamioApp: App {
     @State private var studio = StudioController()
     @State private var permissions = PermissionsManager()
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some Scene {
         // One studio window: capture devices can only be owned once.
@@ -45,6 +46,8 @@ struct StreamioApp: App {
                     Button("Mute Mic/Aux") { studio.toggleMute(.microphone) }
                         .keyboardShortcut("m", modifiers: [.command, .option])
                         .disabled(studio.audioSource(.microphone) == nil)
+                    Button("Mute Mic/Aux 2") { studio.toggleMute(.aux) }
+                        .disabled(studio.audioSource(.aux) == nil)
                     Button("Mute Desktop Audio") { studio.toggleMute(.desktop) }
                         .keyboardShortcut("d", modifiers: [.command, .option])
                         .disabled(studio.audioSource(.desktop) == nil)
@@ -70,9 +73,13 @@ struct StreamioApp: App {
                        action: studio.toggleFullscreenPreview)
                     .keyboardShortcut("f", modifiers: [.command, .shift])
                     .disabled(!permissions.allGranted)
-                Button("Pop Out Program Output") {
-                    openWindow(id: "program")
-                    studio.moveProgramWindowToOtherScreen()
+                Button(studio.isProgramPoppedOut ? "Bring Program Output Back" : "Pop Out Program Output") {
+                    if studio.isProgramPoppedOut {
+                        dismissWindow(id: "program")
+                    } else {
+                        openWindow(id: "program")
+                        studio.moveProgramWindowToOtherScreen()
+                    }
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
                 .disabled(!permissions.allGranted)

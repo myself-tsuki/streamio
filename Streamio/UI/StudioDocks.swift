@@ -249,21 +249,22 @@ struct AudioInputMenu: View {
     @Environment(StudioController.self) private var studio
 
     var body: some View {
-        Menu("Audio Input Capture", systemImage: "mic") {
+        Menu("Audio Input Devices", systemImage: "mic") {
             if studio.devices.microphones.isEmpty {
                 Text("No microphones connected")
             }
             ForEach(studio.devices.microphones) { microphone in
                 Button {
-                    studio.addMicrophone(deviceID: microphone.id)
+                    studio.toggleMicrophone(deviceID: microphone.id)
                 } label: {
-                    if studio.audioSource(.microphone)?.deviceID == microphone.id {
+                    if studio.isInMixer(deviceID: microphone.id) {
                         Label(microphone.name, systemImage: "checkmark")
                     } else {
                         Text(microphone.name)
                     }
                 }
             }
+            Text("Pick a device to add it, pick it again to remove it. Two inputs can run together.")
         }
     }
 }

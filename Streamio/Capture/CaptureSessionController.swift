@@ -48,8 +48,10 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
             audioOutput.audioSettings = [
                 AVFormatIDKey: kAudioFormatLinearPCM,
                 AVSampleRateKey: AudioMixer.sampleRate,
+                AVNumberOfChannelsKey: Int(AudioMixer.channelCount),
                 AVLinearPCMIsFloatKey: true,
                 AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsBigEndianKey: false,
                 AVLinearPCMIsNonInterleaved: true
             ]
             audioOutput.setSampleBufferDelegate(self, queue: audioQueue)

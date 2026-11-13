@@ -22,6 +22,7 @@ nonisolated public final class AudioMonitor: @unchecked Sendable {
     private let controlQueue = DispatchQueue(label: "com.streamio.audio.monitor", qos: .userInitiated)
     private var engine: AVAudioEngine?
     private var engineDeviceUID: String?
+    private var configObserver: NSObjectProtocol?
 
     public var onError: (@Sendable (String) -> Void)?
 
@@ -43,7 +44,7 @@ nonisolated public final class AudioMonitor: @unchecked Sendable {
         controlQueue.async { [self] in
             if channels.isEmpty {
                 stopEngine()
-            } else if engine == nil || engineDeviceUID != deviceUID {
+            } else if engine == nil || engineDeviceUID != deviceUID || engine?.isRunning == false {
                 stopEngine()
                 startEngine(deviceUID: deviceUID)
             }
@@ -63,13 +64,8 @@ nonisolated public final class AudioMonitor: @unchecked Sendable {
 
     private func startEngine(deviceUID: String) {
         let newEngine = AVAudioEngine()
-        let source = AVAudioSourceNode(format: format) { [weak self] _, _, frameCount, bufferList in
-            self?.render(frameCount: Int(frameCount), bufferList: bufferList)
-            return noErr
-        }
-        newEngine.attach(source)
-        newEngine.connect(source, to: newEngine.mainMixerNode, format: format)
 
+        // Pick the output device first; changing it after the graph is wired can leave the engine silent.
         if let deviceID = AudioOutputDevices.deviceID(forUID: deviceUID),
            let unit = newEngine.outputNode.audioUnit {
             var device = deviceID
@@ -77,17 +73,38 @@ nonisolated public final class AudioMonitor: @unchecked Sendable {
                                  &device, UInt32(MemoryLayout<AudioDeviceID>.size))
         }
 
+        let source = AVAudioSourceNode(format: format) { [weak self] _, _, frameCount, bufferList in
+            self?.render(frameCount: Int(frameCount), bufferList: bufferList)
+            return noErr
+        }
+        newEngine.attach(source)
+        newEngine.connect(source, to: newEngine.mainMixerNode, format: format)
+        newEngine.mainMixerNode.outputVolume = 1
+
         newEngine.prepare()
         do {
             try newEngine.start()
             engine = newEngine
             engineDeviceUID = deviceUID
+            // Plugging in or switching headphones (or a Bluetooth route change) stops the engine
+            // without telling anyone. Restart it so monitoring comes back by itself.
+            configObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange, object: newEngine, queue: nil
+            ) { [weak self] _ in
+                self?.controlQueue.async {
+                    guard let self, let uid = self.engineDeviceUID, !self.lock.withLock({ self.monitored.isEmpty }) else { return }
+                    self.stopEngine()
+                    self.startEngine(deviceUID: uid)
+                }
+            }
         } catch {
             onError?(String(localized: "Audio monitoring could not start: \(error.localizedDescription)"))
         }
     }
 
     private func stopEngine() {
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
         engine?.stop()
         engine = nil
         engineDeviceUID = nil

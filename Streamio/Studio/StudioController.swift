@@ -70,6 +70,8 @@ final class StudioController {
     private(set) var isCaptureAuthorized = false
     private(set) var isFullscreenPreview = false
     var showsStatsOverlay = true
+    /// The program output is open in its own window.
+    var isProgramPoppedOut = false
     var alertMessage: String?
 
     let stats = StudioStats()
@@ -165,6 +167,8 @@ final class StudioController {
             if isRecording { pipeline.stopRecording() }
             pipeline.camera.configure(camera: nil, microphone: nil, canvasWidth: resolution.width,
                                       canvasHeight: resolution.height, fps: frameRate.rawValue)
+            pipeline.auxAudio.configure(device: nil)
+            pipeline.extraCameras.stopAll()
             lastCaptureKey = nil
             let screen = pipeline.screen
             Task { await screen.stop() }
@@ -323,11 +327,32 @@ final class StudioController {
         audioSources.first { $0.channel == channel }
     }
 
-    func addMicrophone(deviceID: String) {
-        if let index = audioSources.firstIndex(where: { $0.channel == .microphone }) {
+    /// Input channels that take a capture device, in the order they fill up.
+    static let inputChannels: [AudioChannelID] = [.microphone, .aux]
+
+    /// True when this device is already one of the mixer's inputs.
+    func isInMixer(deviceID: String) -> Bool {
+        Self.inputChannels.contains { audioSource($0)?.deviceID == deviceID }
+    }
+
+    /// Adds the device to the first free input (two can run at once). A device that is already
+    /// there is removed again, so the menu works as a switch for each device.
+    func toggleMicrophone(deviceID: String) {
+        if let channel = Self.inputChannels.first(where: { audioSource($0)?.deviceID == deviceID }) {
+            removeAudio(channel)
+        } else if let free = Self.inputChannels.first(where: { audioSource($0) == nil }) {
+            audioSources.append(AudioSourceConfig(channel: free, deviceID: deviceID))
+        } else {
+            // Both inputs are busy: the second one switches to the new device.
+            addMicrophone(deviceID: deviceID, channel: .aux)
+        }
+    }
+
+    func addMicrophone(deviceID: String, channel: AudioChannelID = .microphone) {
+        if let index = audioSources.firstIndex(where: { $0.channel == channel }) {
             audioSources[index].deviceID = deviceID
         } else {
-            audioSources.append(AudioSourceConfig(channel: .microphone, deviceID: deviceID))
+            audioSources.append(AudioSourceConfig(channel: channel, deviceID: deviceID))
         }
     }
 
@@ -358,12 +383,12 @@ final class StudioController {
     }
 
     func audioTitle(_ channel: AudioChannelID) -> String {
-        guard channel == .microphone, let config = audioSource(.microphone) else { return channel.title }
+        guard Self.inputChannels.contains(channel), let config = audioSource(channel) else { return channel.title }
         return devices.microphoneName(id: config.deviceID)
     }
 
     func isAudioDeviceMissing(_ channel: AudioChannelID) -> Bool {
-        guard channel == .microphone, let config = audioSource(.microphone) else { return false }
+        guard Self.inputChannels.contains(channel), let config = audioSource(channel) else { return false }
         return devices.microphone(id: config.deviceID) == nil
     }
 
@@ -583,6 +608,7 @@ final class StudioController {
         var fps: Int
         var showsCursor: Bool
         var extraCameraIDs: [String] = []
+        var auxID: String?
     }
 
     private func reconfigureCapture(force: Bool = false) {
@@ -597,7 +623,8 @@ final class StudioController {
         }
         let key = CaptureKey(cameraID: keyCameraID, microphoneID: audioSource(.microphone)?.deviceID, displayID: keyDisplayID,
                              desktopAudio: audioSource(.desktop) != nil, width: resolution.width, height: resolution.height,
-                             fps: frameRate.rawValue, showsCursor: showsCursor, extraCameraIDs: extraIDs)
+                             fps: frameRate.rawValue, showsCursor: showsCursor, extraCameraIDs: extraIDs,
+                             auxID: audioSource(.aux)?.deviceID)
         guard force || key != lastCaptureKey else { return }
         lastCaptureKey = key
 
@@ -611,6 +638,7 @@ final class StudioController {
         var extraDevices: [String: AVCaptureDevice] = [:]
         for id in extraIDs { if let device = devices.camera(id: id) { extraDevices[id] = device } }
         pipeline.extraCameras.configure(devices: extraDevices, fps: frameRate.rawValue)
+        pipeline.auxAudio.configure(device: audioSource(.aux).flatMap { devices.microphone(id: $0.deviceID) })
         let microphoneDevice = audioSource(.microphone).flatMap { devices.microphone(id: $0.deviceID) }
         pipeline.camera.configure(camera: cameraDevice, microphone: microphoneDevice,
                                   canvasWidth: resolution.width, canvasHeight: resolution.height, fps: frameRate.rawValue)

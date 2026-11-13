@@ -14,6 +14,7 @@ struct StudioStage: View {
 
     @Environment(StudioController.self) private var studio
     @FocusState private var isFocused: Bool
+    @Environment(\.dismissWindow) private var dismissWindow
     @State private var showsCustomizer = false
     let mode: Mode
 
@@ -91,6 +92,10 @@ struct StudioStage: View {
                 case .popout:
                     Button("Toggle Full Screen", systemImage: "arrow.up.left.and.arrow.down.right") { toggleFullScreen() }
                         .help("Full screen on this display")
+                    Button("Return Preview to Studio", systemImage: "arrow.uturn.backward") {
+                        dismissWindow(id: "program")
+                    }
+                    .help("Close this window and put the preview back in the studio window")
                 }
             }
             .labelStyle(.iconOnly)
@@ -122,6 +127,12 @@ struct ProgramWindowView: View {
         }
         .frame(minWidth: 480, minHeight: 300)
         .containerBackground(.black, for: .window)
+        .onAppear { studio.isProgramPoppedOut = true }
+        .onDisappear { studio.isProgramPoppedOut = false }
+        // Closing the window with its red button must also hand the preview back.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
+            if (note.object as? NSWindow)?.title == StudioController.programWindowTitle { studio.isProgramPoppedOut = false }
+        }
     }
 }
 

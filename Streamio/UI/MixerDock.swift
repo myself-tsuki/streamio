@@ -82,8 +82,8 @@ struct MixerChannelStrip: View {
                         Text(title)
                             .font(.subheadline.bold())
                             .lineLimit(1)
-                        if channel == .microphone {
-                            Text("Mic/Aux")
+                        if StudioController.inputChannels.contains(channel) {
+                            Text(channel == .aux ? "Mic/Aux 2" : "Mic/Aux")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -237,7 +237,7 @@ struct AudioPropertiesView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if channel == .microphone {
+                if StudioController.inputChannels.contains(channel) {
                     Section("Device") {
                         Picker("Microphone", selection: config.deviceID) {
                             ForEach(studio.devices.microphones) { Text($0.name).tag($0.id) }

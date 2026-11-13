@@ -9,6 +9,8 @@ import Foundation
 nonisolated public enum AudioChannelID: String, CaseIterable, Identifiable, Codable, Sendable {
     case desktop
     case microphone
+    /// A second input device (another mic or an audio interface) next to the first.
+    case aux
 
     public var id: String { rawValue }
 
@@ -16,6 +18,7 @@ nonisolated public enum AudioChannelID: String, CaseIterable, Identifiable, Coda
         switch self {
         case .desktop: String(localized: "Desktop Audio")
         case .microphone: String(localized: "Mic/Aux")
+        case .aux: String(localized: "Mic/Aux 2")
         }
     }
 
@@ -23,6 +26,7 @@ nonisolated public enum AudioChannelID: String, CaseIterable, Identifiable, Coda
         switch self {
         case .desktop: "speaker.wave.2"
         case .microphone: "mic"
+        case .aux: "mic.badge.plus"
         }
     }
 }
