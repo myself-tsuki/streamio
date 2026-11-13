@@ -91,6 +91,15 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
     /// Swaps inputs. Pass nil to remove the camera (e.g. a display scene) or the microphone.
     public func configure(camera: AVCaptureDevice?, microphone: AVCaptureDevice?, canvasWidth: Int, canvasHeight: Int, fps: Int) {
         sessionQueue.async { [self] in
+            // Nothing to change: leave the running session alone. Even an empty begin/commit pair
+            // can make a USB camera or microphone skip a moment.
+            let formatKey = camera.map { "\($0.uniqueID)|\(canvasWidth)x\(canvasHeight)@\(fps)" }
+            if videoInput?.device == camera, audioInput?.device == microphone,
+               formatKey == nil || formatKey == appliedFormatKey {
+                let needsSession = videoInput != nil || audioInput != nil
+                if needsSession, !session.isRunning { session.startRunning() }
+                return
+            }
             session.beginConfiguration()
 
             if videoInput?.device != camera {

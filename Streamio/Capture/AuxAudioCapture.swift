@@ -33,7 +33,10 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
     private let heartbeat = AudioHeartbeat()
     private var watchdog: DispatchSourceTimer?
 
-    override init() {
+    private let name: String
+
+    init(name: String = "The second audio input") {
+        self.name = name
         super.init()
         output.setSampleBufferDelegate(self, queue: queue)
         // A USB device that hiccups can leave the session running but silent. Restart it.
@@ -52,7 +55,7 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
             forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
         ) { [weak self] notification in
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
-            self?.onError?(error?.localizedDescription ?? String(localized: "The second audio input stopped unexpectedly."))
+            self?.onError?(error?.localizedDescription ?? String(localized: "\(self?.name ?? "The audio input") stopped unexpectedly."))
             self?.sessionQueue.asyncAfter(deadline: .now() + 1) {
                 guard let self, self.input != nil, !self.session.isRunning else { return }
                 self.session.startRunning()
@@ -97,6 +100,8 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let gap = heartbeat.silence
+        if gap > 0.25 { DiagnosticsLog.log("capture", "\(name): no audio for \(Int(gap * 1000)) ms before this buffer") }
         heartbeat.beat()
         onAudio?(sampleBuffer)
     }

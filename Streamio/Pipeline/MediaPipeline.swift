@@ -77,7 +77,10 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
     let camera = CaptureSessionController()
     let screen = ScreenCaptureController()
     let extraCameras = ExtraCameraCapture()
-    let auxAudio = AuxAudioCapture()
+    /// Each microphone runs on its own capture session, apart from the camera, so a camera that
+    /// renegotiates or stalls can never interrupt the audio.
+    let micAudio = AuxAudioCapture(name: "The microphone")
+    let auxAudio = AuxAudioCapture(name: "The second audio input")
     private var videoPlayers: [String: VideoFilePlayer] = [:]
     private let videoEncoder = VideoEncoder()
     private let audioEncoder: AudioEncoder
@@ -133,8 +136,9 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
         monitor.onError = { [weak self] message in self?.onEvent?(.captureError(message)) }
 
         camera.onVideo = { [weak self] sample in self?.ingestVideo(sample, into: .camera) }
-        camera.onAudio = { [weak self] sample in self?.mixer.ingest(sample, from: .microphone) }
         camera.onError = { [weak self] message in self?.onEvent?(.captureError(message)) }
+        micAudio.onAudio = { [weak self] sample in self?.mixer.ingest(sample, from: .microphone) }
+        micAudio.onError = { [weak self] message in self?.onEvent?(.captureError(message)) }
         auxAudio.onAudio = { [weak self] sample in self?.mixer.ingest(sample, from: .aux) }
         auxAudio.onError = { [weak self] message in self?.onEvent?(.captureError(message)) }
         extraCameras.onVideo = { [weak self] id, sample in self?.ingestVideo(sample, into: .extraCamera(id)) }

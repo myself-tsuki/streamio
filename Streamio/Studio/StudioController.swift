@@ -149,7 +149,8 @@ final class StudioController {
         pipeline.onEvent = { [weak self] event in
             Task { @MainActor in self?.handle(event) }
         }
-        devices.onChange = { [weak self] in self?.reconfigureCapture(force: true) }
+        // Only a change to a device this scene uses (it appears in the key) re-applies capture.
+        devices.onChange = { [weak self] in self?.reconfigureCapture() }
         observers.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didExitFullScreenNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -179,6 +180,7 @@ final class StudioController {
         } else {
             stopAllStreams()
             if isRecording { pipeline.stopRecording() }
+            pipeline.micAudio.configure(device: nil)
             pipeline.camera.configure(camera: nil, microphone: nil, canvasWidth: resolution.width,
                                       canvasHeight: resolution.height, fps: frameRate.rawValue)
             pipeline.auxAudio.configure(device: nil)
@@ -623,6 +625,11 @@ final class StudioController {
         var showsCursor: Bool
         var extraCameraIDs: [String] = []
         var auxID: String?
+        var cameraPresent = false
+        var microphonePresent = false
+        var auxPresent = false
+        var displayPresent = false
+        var extraPresent: [String] = []
     }
 
     private func reconfigureCapture(force: Bool = false) {
@@ -638,8 +645,14 @@ final class StudioController {
         let key = CaptureKey(cameraID: keyCameraID, microphoneID: audioSource(.microphone)?.deviceID, displayID: keyDisplayID,
                              desktopAudio: audioSource(.desktop) != nil, width: resolution.width, height: resolution.height,
                              fps: frameRate.rawValue, showsCursor: showsCursor, extraCameraIDs: extraIDs,
-                             auxID: audioSource(.aux)?.deviceID)
+                             auxID: audioSource(.aux)?.deviceID,
+                             cameraPresent: keyCameraID.flatMap { devices.camera(id: $0) } != nil,
+                             microphonePresent: audioSource(.microphone).flatMap { devices.microphone(id: $0.deviceID) } != nil,
+                             auxPresent: audioSource(.aux).flatMap { devices.microphone(id: $0.deviceID) } != nil,
+                             displayPresent: keyDisplayID.map { id in devices.displays.contains { $0.id == id } } ?? false,
+                             extraPresent: extraIDs.filter { devices.camera(id: $0) != nil })
         guard force || key != lastCaptureKey else { return }
+        DiagnosticsLog.log("capture", "applying capture setup (forced: \(force))")
         lastCaptureKey = key
 
         var cameraID: String?
@@ -654,7 +667,8 @@ final class StudioController {
         pipeline.extraCameras.configure(devices: extraDevices, fps: frameRate.rawValue)
         pipeline.auxAudio.configure(device: audioSource(.aux).flatMap { devices.microphone(id: $0.deviceID) })
         let microphoneDevice = audioSource(.microphone).flatMap { devices.microphone(id: $0.deviceID) }
-        pipeline.camera.configure(camera: cameraDevice, microphone: microphoneDevice,
+        pipeline.micAudio.configure(device: microphoneDevice)
+        pipeline.camera.configure(camera: cameraDevice, microphone: nil,
                                   canvasWidth: resolution.width, canvasHeight: resolution.height, fps: frameRate.rawValue)
 
         var displayID: CGDirectDisplayID?

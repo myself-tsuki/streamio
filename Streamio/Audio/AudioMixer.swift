@@ -83,6 +83,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
     private var emaLevel: [AudioChannelID: Double] = [:]
     private var steerTarget: [AudioChannelID: Double] = [:]
     private var steerTick: [AudioChannelID: Int] = [:]
+    private var needsFadeIn: Set<AudioChannelID> = []
 
     /// Health counters, written to the diagnostics log every 10 seconds.
     private struct Counters {
@@ -250,6 +251,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
             if primed[channel] != true {
                 guard available >= prime else { continue }
                 primed[channel] = true
+                needsFadeIn.insert(channel)
                 emaLevel[channel] = Double(available)
                 steerTarget[channel] = Double(available)
             }
@@ -260,8 +262,10 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
                 emaLevel[channel] = Double(available)
                 steerTarget[channel] = Double(available)
             }
+            var underrun = false
             if available < frames {
                 // A real stall: play what there is, then wait for the cushion to refill.
+                underrun = true
                 primed[channel] = false
                 counters[channel, default: Counters()].underruns += 1
             }
@@ -288,7 +292,26 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
                 scratchRight.withUnsafeMutableBufferPointer { right in
                     vDSP_vclr(left.baseAddress!, 1, vDSP_Length(frames))
                     vDSP_vclr(right.baseAddress!, 1, vDSP_Length(frames))
+                    let got = min(take, available)
                     rings[channel]?.mix(into: left, right, count: take, gain: 1)
+                    // 5 ms ramps at the edges of a gap, so a stall is a short silence, not a click.
+                    let ramp = 240
+                    if needsFadeIn.contains(channel) {
+                        for i in 0..<min(ramp, got) {
+                            let gain = Float(i) / Float(ramp)
+                            left[i] *= gain
+                            right[i] *= gain
+                        }
+                        needsFadeIn.remove(channel)
+                    }
+                    if underrun, got > 0 {
+                        let n = min(ramp, got)
+                        for i in 0..<n {
+                            let gain = 1 - Float(i + 1) / Float(n)
+                            left[got - n + i] *= gain
+                            right[got - n + i] *= gain
+                        }
+                    }
                     if take < frames, take > 0 {
                         left[frames - 1] = left[take - 1]
                         right[frames - 1] = right[take - 1]
