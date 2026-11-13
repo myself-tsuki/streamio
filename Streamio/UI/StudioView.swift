@@ -37,10 +37,13 @@ struct StudioView: View {
                     if showsSidebar {
                         VStack(spacing: Theme.spacingM) {
                             ScenesDock()
+                                .frame(minHeight: 120, idealHeight: 140, maxHeight: 160)
                             SourcesDock()
+                                .frame(maxHeight: .infinity)
                                 .layoutPriority(1)
                         }
                         .frame(width: Theme.sidebarWidth)
+                        .frame(maxHeight: .infinity)
                         .transition(.move(edge: .leading).combined(with: .opacity))
                     }
 
@@ -50,7 +53,7 @@ struct StudioView: View {
                         AudioMixerDock()
                             .frame(height: Theme.mixerHeight)
                     }
-                    .frame(minWidth: 560)
+                    .frame(minWidth: 560, maxWidth: .infinity, maxHeight: .infinity)
 
                     VStack(spacing: Theme.spacingM) {
                         ControlsDock()
@@ -58,9 +61,12 @@ struct StudioView: View {
                         DestinationsDock()
                             .fixedSize(horizontal: false, vertical: true)
                         SourcePropertiesDock()
+                            .frame(maxHeight: .infinity)
                     }
                     .frame(width: Theme.controlsWidth)
+                    .frame(maxHeight: .infinity)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             StudioStatusBar()
         }
