@@ -271,7 +271,7 @@ struct StatsBar: View {
         switch widget.style {
         case .label: nil
         case .number: 132
-        case .graph: 270
+        case .graph: 132
         case .gauge: widget.metric.supportsGauge ? Self.gaugeSide : 132
         }
     }

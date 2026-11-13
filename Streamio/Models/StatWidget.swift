@@ -66,7 +66,7 @@ nonisolated enum WidgetStyle: String, Codable, CaseIterable, Identifiable, Senda
     case number
     /// Square speedometer tile.
     case gauge
-    /// Wide level graph with a monitor button. Microphone only.
+    /// Level graph behind a small readout and a listen button. Microphone only.
     case graph
 
     var id: String { rawValue }
@@ -85,7 +85,7 @@ nonisolated enum WidgetStyle: String, Codable, CaseIterable, Identifiable, Senda
         switch self {
         case .label, .number: (2, 1)
         case .gauge: (2, 2)
-        case .graph: (3, 1)
+        case .graph: (2, 1)
         }
     }
 }

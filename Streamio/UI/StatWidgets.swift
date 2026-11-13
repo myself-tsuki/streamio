@@ -244,7 +244,7 @@ struct NumberWidgetView: View {
 
 // MARK: - Speedometer
 
-/// Car-style dial: numbered scale, minor ticks, a coloured safe-range band, a tapered needle on
+/// Dial: numbered scale, minor ticks, a coloured safe-range band, a tapered needle on
 /// a metal hub and a digital readout, all on a dark face set into the glass tile.
 struct GaugeWidgetView: View {
     let reading: StatReading
@@ -287,16 +287,13 @@ struct GaugeWidgetView: View {
                 NeedleShape()
                     .fill(LinearGradient(colors: [accent, accent.opacity(0.75)], startPoint: .top, endPoint: .bottom))
                     .frame(width: r * 0.1, height: r * 1.6)
-                    .shadow(color: accent.opacity(0.7), radius: r * 0.06)
                     .rotationEffect(.degrees(Self.start + Self.sweep * reading.fraction))
                     .animation(.smooth(duration: 0.55), value: reading.fraction)
 
                 // Hub
                 Circle()
-                    .fill(RadialGradient(colors: [.white.opacity(0.95), Color(white: 0.35)], center: .topLeading,
-                                         startRadius: 0, endRadius: r * 0.2))
-                    .overlay { Circle().strokeBorder(.black.opacity(0.5), lineWidth: 1) }
-                    .frame(width: r * 0.2, height: r * 0.2)
+                    .fill(.white.opacity(0.9))
+                    .frame(width: r * 0.14, height: r * 0.14)
 
                 // Scale caption and digital readout in the open gap at the bottom.
                 VStack(spacing: r * 0.04) {
@@ -317,11 +314,6 @@ struct GaugeWidgetView: View {
                     }
                     .lineLimit(1)
                     .minimumScaleFactor(0.5)
-                    .padding(.horizontal, r * 0.14)
-                    .padding(.vertical, r * 0.04)
-                    .frame(minWidth: r * 0.9)
-                    .background(.black.opacity(0.5), in: .rect(cornerRadius: r * 0.1))
-                    .overlay { RoundedRectangle(cornerRadius: r * 0.1).strokeBorder(.white.opacity(0.14), lineWidth: 1) }
                 }
                 .offset(y: r * 0.62)
             }
@@ -354,19 +346,15 @@ struct GaugeWidgetView: View {
         let center = CGPoint(x: size.width / 2, y: size.height / 2)
         let face = CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
 
-        // Dark dial face, deeper toward the rim, with a bezel catching light.
-        context.fill(Path(ellipseIn: face), with: .radialGradient(
-            Gradient(colors: [.black.opacity(0.42), .black.opacity(0.7)]), center: center, startRadius: 0, endRadius: r))
-        context.stroke(Path(ellipseIn: face), with: .linearGradient(
-            Gradient(colors: [.white.opacity(0.75), .white.opacity(0.08), .white.opacity(0.3)]),
-            startPoint: CGPoint(x: face.minX, y: face.minY), endPoint: CGPoint(x: face.maxX, y: face.maxY)),
-            lineWidth: max(1.5, r * 0.04))
+        // Light dial face on the glass with a thin rim.
+        context.fill(Path(ellipseIn: face), with: .color(.black.opacity(0.22)))
+        context.stroke(Path(ellipseIn: face), with: .color(.white.opacity(0.3)), lineWidth: 1)
 
         guard let scale = reading.scale else { return }
 
         // Safe-range band along the rim.
         let bandRadius = r * 0.9
-        let bandWidth = max(2, r * 0.06)
+        let bandWidth = max(2, r * 0.045)
         let sorted = reading.zones.sorted { $0.from < $1.from }
         for (index, zone) in sorted.enumerated() {
             let from = min(max(zone.from / scale.max, 0), 1)
@@ -385,10 +373,11 @@ struct GaugeWidgetView: View {
         for index in 0...(majors * minorsPerMajor) {
             let fraction = Double(index) / Double(majors * minorsPerMajor)
             let isMajor = index % minorsPerMajor == 0
+            if !isMajor && r < 70 { continue }
             var tick = Path()
             tick.move(to: Self.point(center: center, radius: tickOuter, fraction: fraction))
             tick.addLine(to: Self.point(center: center, radius: tickOuter - r * (isMajor ? 0.12 : 0.06), fraction: fraction))
-            context.stroke(tick, with: .color(.white.opacity(isMajor ? 0.95 : 0.45)),
+            context.stroke(tick, with: .color(.white.opacity(isMajor ? 0.9 : 0.35)),
                            style: StrokeStyle(lineWidth: max(1, r * (isMajor ? 0.035 : 0.018)), lineCap: .round))
         }
         let showEveryLabel = r > 52 || majors <= 6
@@ -420,69 +409,57 @@ struct NeedleShape: Shape {
 
 // MARK: - Microphone graph
 
-/// Rolling level graph of the microphone with a monitor button and output picker, so the mic
-/// can be heard in headphones or speakers right from the widget.
+/// Microphone tile, same size as the number tiles: the level graph fills the background, with
+/// a small label, the level in dB and one button to listen through the monitor output.
 struct MicGraphWidgetView: View {
     @Environment(StudioController.self) private var studio
     let height: CGFloat
     var chrome = true
 
     var body: some View {
-        @Bindable var studio = studio
         let config = studio.audioSource(.microphone)
         let missing = studio.isAudioDeviceMissing(.microphone)
         let history = studio.meters.microphoneHistory
         let current = history.last ?? AudioLevels.floor
         let isMonitoring = config?.monitoring.isMonitoring ?? false
         let isMuted = config?.isMuted ?? false
-        let state = config == nil ? "No mic" : (missing ? "Unplugged" : (isMuted ? "Muted" : (current <= -59 ? "—" : String(format: "%.0f dB", current))))
+        let level = config == nil ? "No mic" : (missing ? "Unplugged" : (isMuted ? "Muted" : (current <= -59 ? "—" : String(format: "%.0f dB", current))))
+        let shape = RoundedRectangle(cornerRadius: height * 0.3, style: .continuous)
 
-        HStack(spacing: height * 0.12) {
-            VStack(alignment: .leading, spacing: 0) {
-                Label("Mic", systemImage: missing || config == nil ? "mic.slash.fill" : (isMuted ? "mic.slash" : "mic.fill"))
-                    .font(.system(size: max(12, height * 0.17), weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text(state)
-                    .font(.system(size: max(13, height * 0.24), weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(missing ? Theme.zoneDanger : (current > -6 && !isMuted ? Theme.zoneDanger : Color.primary))
-                    .minimumScaleFactor(0.6)
-            }
-            .lineLimit(1)
-            .frame(minWidth: height * 0.95, alignment: .leading)
-
+        ZStack {
             MicGraph(history: history, dimmed: isMuted || missing || config == nil)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.vertical, height * 0.2)
+                .padding(.horizontal, height * 0.14)
+                .padding(.vertical, height * 0.1)
+                .opacity(0.8)
 
-            HStack(spacing: 2) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Label("Mic", systemImage: missing || config == nil ? "mic.slash.fill" : (isMuted ? "mic.slash" : "mic.fill"))
+                        .font(.system(size: max(12, height * 0.17), weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(level)
+                        .font(.system(size: max(11, height * 0.16), weight: .medium, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(missing || (current > -6 && !isMuted) ? Theme.zoneDanger : Color.secondary)
+                }
+                .lineLimit(1)
+                Spacer(minLength: 0)
                 Button(isMonitoring ? "Stop Listening" : "Listen to Microphone",
                        systemImage: isMonitoring ? "headphones.circle.fill" : "headphones") {
                     studio.toggleMonitoring(.microphone)
                 }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                .font(.system(size: max(16, height * 0.32)))
                 .foregroundStyle(isMonitoring ? Color.accentColor : Color.primary)
                 .disabled(config == nil)
-                .help(isMonitoring ? "Stop listening to the microphone" : "Listen to the microphone through the monitor output")
-
-                Menu {
-                    Picker("Listen Through", selection: $studio.monitorDeviceUID) {
-                        Text("System Default Output").tag("")
-                        ForEach(AudioOutputDevices.all()) { Text($0.name).tag($0.id) }
-                    }
-                } label: {
-                    Label("Choose headphones or speakers", systemImage: "speaker.wave.2")
-                }
-                .menuIndicator(.visible)
-                .help("Choose where the microphone is played: headphones or speakers")
+                .help(isMonitoring ? "Stop listening" : "Listen through the default output")
             }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.borderless)
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .font(.system(size: max(14, height * 0.3)))
+            .padding(.horizontal, height * 0.18)
+            .padding(.vertical, height * 0.12)
         }
-        .padding(.horizontal, height * 0.2)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(shape)
         .modifier(WidgetChrome(enabled: chrome, tint: isMonitoring ? Color.accentColor.opacity(0.25) : nil,
                                radius: height * 0.3))
     }
