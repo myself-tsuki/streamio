@@ -10,7 +10,7 @@
 import Foundation
 
 nonisolated enum StatMetric: String, Codable, CaseIterable, Identifiable, Sendable {
-    case live, rec, fps, cameraFPS, render, cpu, gpu, memory, bitrate, dropped, disk, ping
+    case live, rec, fps, cameraFPS, render, cpu, gpu, memory, bitrate, dropped, disk, ping, microphone
 
     var id: String { rawValue }
 
@@ -28,6 +28,7 @@ nonisolated enum StatMetric: String, Codable, CaseIterable, Identifiable, Sendab
         case .dropped: "Dropped frames"
         case .disk: "Free disk"
         case .ping: "Ping"
+        case .microphone: "Microphone level"
         }
     }
 
@@ -45,13 +46,14 @@ nonisolated enum StatMetric: String, Codable, CaseIterable, Identifiable, Sendab
         case .dropped: "exclamationmark.triangle"
         case .disk: "internaldrive"
         case .ping: "network"
+        case .microphone: "mic.fill"
         }
     }
 
     /// Metrics with a meaningful 0...1 range can be drawn as a speedometer.
     var supportsGauge: Bool {
         switch self {
-        case .live, .rec, .disk: false
+        case .live, .rec, .disk, .microphone: false
         default: true
         }
     }
@@ -64,6 +66,8 @@ nonisolated enum WidgetStyle: String, Codable, CaseIterable, Identifiable, Senda
     case number
     /// Square speedometer tile.
     case gauge
+    /// Wide level graph with a monitor button. Microphone only.
+    case graph
 
     var id: String { rawValue }
 
@@ -72,6 +76,7 @@ nonisolated enum WidgetStyle: String, Codable, CaseIterable, Identifiable, Senda
         case .label: "Label"
         case .number: "Number"
         case .gauge: "Speedometer"
+        case .graph: "Level graph"
         }
     }
 
@@ -80,6 +85,7 @@ nonisolated enum WidgetStyle: String, Codable, CaseIterable, Identifiable, Senda
         switch self {
         case .label, .number: (2, 1)
         case .gauge: (2, 2)
+        case .graph: (3, 1)
         }
     }
 }

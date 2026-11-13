@@ -265,12 +265,13 @@ struct StatsBar: View {
     }
 
     private static let tileHeight: CGFloat = 52
-    private static let gaugeSide: CGFloat = 92
+    private static let gaugeSide: CGFloat = 124
 
     private func width(of widget: StatWidget) -> CGFloat? {
         switch widget.style {
         case .label: nil
         case .number: 132
+        case .graph: 270
         case .gauge: widget.metric.supportsGauge ? Self.gaugeSide : 132
         }
     }
@@ -278,7 +279,7 @@ struct StatsBar: View {
     private func height(of widget: StatWidget) -> CGFloat? {
         switch widget.style {
         case .label: nil
-        case .number: Self.tileHeight
+        case .number, .graph: Self.tileHeight
         case .gauge: widget.metric.supportsGauge ? Self.gaugeSide : Self.tileHeight
         }
     }

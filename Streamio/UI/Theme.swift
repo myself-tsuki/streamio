@@ -25,6 +25,11 @@ enum Theme {
     static let live = Color.red
     static let warning = Color.orange
     static let good = Color.green
+    // Gauge zones: how a figure relates to its safe range. Each is paired with a word on the dial.
+    static let zoneNormal = Color.green
+    static let zoneHigh = Color.cyan
+    static let zoneCaution = Color.orange
+    static let zoneDanger = Color.red
     static let meterGreen = Color.green
     static let meterYellow = Color.yellow
     static let meterRed = Color.red

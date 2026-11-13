@@ -312,6 +312,7 @@ struct WidgetCustomizer: View {
     }
 
     private func styles(for metric: StatMetric, allowsLabel: Bool) -> [WidgetStyle] {
+        if metric == .microphone { return [.graph] }
         var styles: [WidgetStyle] = allowsLabel ? [.label, .number] : [.number]
         if metric.supportsGauge { styles.append(.gauge) }
         return styles
