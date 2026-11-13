@@ -35,7 +35,9 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
         super.init()
         sessionQueue.async { [self] in
             session.beginConfiguration()
-            session.sessionPreset = .inputPriority
+            if session.canSetSessionPreset(.high) {
+                session.sessionPreset = .high
+            }
 
             videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
             videoOutput.alwaysDiscardsLateVideoFrames = true

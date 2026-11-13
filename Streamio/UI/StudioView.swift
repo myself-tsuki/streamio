@@ -265,17 +265,17 @@ struct StatsBar: View {
                 metric("REC", Duration.clock(since: stats.recordStart, now: context.date), "record.circle")
                     .foregroundStyle(studio.isRecording ? Theme.live : .primary)
                 Divider().frame(height: 14)
-                metric("FPS", "\(stats.fps, format: .number.precision(.fractionLength(2))) / \(studio.frameRate.rawValue)", "film")
+                metric("FPS", "\(String(format: "%.1f", stats.fps)) / \(studio.frameRate.rawValue)", "film")
                 if studio.selectedScene?.cameraSource != nil {
-                    metric("Camera", "\(stats.cameraFPS, format: .number.precision(.fractionLength(1))) fps", "web.camera")
+                    metric("Camera", "\(String(format: "%.1f", stats.cameraFPS)) fps", "web.camera")
                 }
                 if style == .overlay {
-                    metric("Render", "\(stats.renderMilliseconds, format: .number.precision(.fractionLength(1))) ms", "timer")
+                    metric("Render", "\(String(format: "%.1f", stats.renderMilliseconds)) ms", "timer")
                 }
                 Spacer(minLength: Theme.spacingS)
-                metric("CPU", "\(stats.cpuPercent, format: .number.precision(.fractionLength(1)))%", "cpu")
+                metric("CPU", String(format: "%.1f%%", stats.cpuPercent), "cpu")
                 metric("GPU", stats.gpuPercent.map { "\(Int($0))%" } ?? "—", "rectangle.3.group")
-                metric("Memory", stats.memoryBytes.formatted(.byteCount(style: .memory)), "memorychip")
+                metric("Memory", ByteCountFormatter.string(fromByteCount: Int64(stats.memoryBytes), countStyle: .memory), "memorychip")
                 Divider().frame(height: 14)
                 metric("Bitrate", "\(Int(stats.bitrateKbps)) kb/s", "speedometer")
                     .foregroundStyle(stats.congestion > 0.5 ? Theme.warning : .primary)
@@ -286,10 +286,10 @@ struct StatsBar: View {
                             .foregroundStyle(studio.status(of: destination.id).tint)
                     }
                 }
-                metric("Dropped", "\(stats.droppedFrames) (\(stats.droppedPercent, format: .number.precision(.fractionLength(1)))%)",
+                metric("Dropped", "\(stats.droppedFrames) (\(String(format: "%.1f", stats.droppedPercent))%)",
                        "exclamationmark.triangle")
                 if style == .overlay, let free = stats.diskFreeBytes {
-                    metric("Disk", "\(free.formatted(.byteCount(style: .file))) free", "internaldrive")
+                    metric("Disk", "\(ByteCountFormatter.string(fromByteCount: Int64(free), countStyle: .file)) free", "internaldrive")
                 }
             }
             .font(style == .overlay ? .body.monospacedDigit() : .callout.monospacedDigit())

@@ -122,7 +122,7 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
         mixer.onLevels = { [weak self] levels in self?.onEvent?(.levels(levels)) }
         mixer.onMixedAudio = { [weak self] buffer, time in
             guard let self else { return }
-            let (streaming, recording) = lock.withLock { (!clients.isEmpty, isRecording) }
+            let (streaming, recording) = lock.withLock { (!self.clients.isEmpty, self.isRecording) }
             if streaming { audioEncoder.encode(buffer, time: time) }
             if recording { recorder.appendAudio(buffer, time: time) }
         }
@@ -130,14 +130,14 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
         videoEncoder.onFormat = { [weak self] record, _ in
             guard let self else { return }
             let targets = lock.withLock {
-                videoSequenceHeader = record
-                return Array(clients.values)
+                self.videoSequenceHeader = record
+                return Array(self.clients.values)
             }
             for client in targets { client.setVideoSequenceHeader(record) }
         }
         videoEncoder.onFrame = { [weak self] frame in
             guard let self else { return }
-            let (targets, recording) = lock.withLock { (Array(clients.values), isRecording) }
+            let (targets, recording) = lock.withLock { (Array(self.clients.values), self.isRecording) }
             for client in targets {
                 client.sendVideo(accessUnit: frame.accessUnit, pts: frame.pts, dts: frame.dts, isKeyFrame: frame.isKeyFrame)
             }
@@ -146,21 +146,21 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
         audioEncoder.onConfig = { [weak self] config in
             guard let self else { return }
             let targets = lock.withLock {
-                audioSequenceHeader = config
-                return Array(clients.values)
+                self.audioSequenceHeader = config
+                return Array(self.clients.values)
             }
             for client in targets { client.setAudioSequenceHeader(config) }
         }
         audioEncoder.onPacket = { [weak self] packet, pts in
             guard let self else { return }
-            let targets = lock.withLock { Array(clients.values) }
+            let targets = lock.withLock { Array(self.clients.values) }
             for client in targets { client.sendAudio(aacPacket: packet, pts: pts) }
         }
 
         recorder.onEvent = { [weak self] event in
             guard let self else { return }
             if case .started = event {} else {
-                lock.withLock { isRecording = false }
+                lock.withLock { self.isRecording = false }
                 stopEncoderIfIdle()
             }
             onEvent?(.recording(event))
@@ -206,8 +206,8 @@ nonisolated final class MediaPipeline: @unchecked Sendable {
             let buffer = MetalPipeline.makePixelBuffer(contentsOf: URL(fileURLWithPath: path))
             guard let self else { return }
             lock.withLock {
-                loadingImages.remove(path)
-                if let buffer { images[path] = buffer }
+                self.loadingImages.remove(path)
+                if let buffer { self.images[path] = buffer }
             }
             if buffer == nil {
                 onEvent?(.captureError(String(localized: "Streamio could not open the image at \(path).")))

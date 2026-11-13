@@ -107,15 +107,7 @@ struct MixerChannelStrip: View {
                     MeterScale()
                     Slider(value: gain, in: Double(AudioSourceConfig.minimumGain)...Double(AudioSourceConfig.maximumGain)) {
                         Text("\(title) Volume")
-                    } ticks: {
-                        SliderTick(value: -40)
-                        SliderTick(value: -20)
-                        SliderTick(value: -10)
-                        SliderTick(value: 0)
-                        SliderTick(value: 10)
-                        SliderTick(value: 20)
                     }
-                    .sliderNeutralValue(0)
                     .labelsHidden()
                     .accessibilityValue(Text(Self.decibelText(config.gainDecibels)))
                 }
@@ -204,7 +196,6 @@ struct AudioPropertiesView: View {
                         HStack {
                             Slider(value: config.gainDecibels,
                                    in: AudioSourceConfig.minimumGain...AudioSourceConfig.maximumGain) { Text("Gain") }
-                                .sliderNeutralValue(0)
                                 .labelsHidden()
                             TextField("Gain in dB", value: Binding<Double>(
                                 get: { Double(config.wrappedValue.gainDecibels) },
@@ -224,10 +215,7 @@ struct AudioPropertiesView: View {
                     LabeledContent("Balance") {
                         HStack {
                             Text("L").foregroundStyle(.secondary)
-                            Slider(value: config.balance, in: -1...1) { Text("Balance") } ticks: {
-                                SliderTick(value: 0)
-                            }
-                            .sliderNeutralValue(0)
+                            Slider(value: config.balance, in: -1...1) { Text("Balance") }
                             .labelsHidden()
                             Text("R").foregroundStyle(.secondary)
                         }

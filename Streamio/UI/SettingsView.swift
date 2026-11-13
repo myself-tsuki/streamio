@@ -167,8 +167,6 @@ struct OutputSettingsPane: View {
                 LabeledContent("Video Bitrate") {
                     Slider(value: $studio.videoBitrateKbps, in: 1000...20000, step: 250) {
                         Text("Video Bitrate")
-                    } ticks: {
-                        SliderTick(value: Double(studio.resolution.recommendedBitrate / 1000))
                     }
                     .labelsHidden()
                 }

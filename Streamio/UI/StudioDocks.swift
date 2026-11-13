@@ -446,10 +446,7 @@ struct SourcePropertiesForm: View {
 
     private func adjustment(_ title: LocalizedStringKey, _ value: Binding<Float>, _ range: ClosedRange<Float>, neutral: Float) -> some View {
         LabeledContent(title) {
-            Slider(value: value, in: range) { Text(title) } ticks: {
-                SliderTick(value: neutral)
-            }
-            .sliderNeutralValue(neutral)
+            Slider(value: value, in: range) { Text(title) }
             .labelsHidden()
         }
     }
