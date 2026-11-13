@@ -58,3 +58,15 @@ extension StreamStatus {
         }
     }
 }
+
+extension StreamingService {
+    /// Glyph for destination pills.
+    var systemImage: String {
+        switch self {
+        case .youtube: "play.rectangle.fill"
+        case .twitch: "gamecontroller.fill"
+        case .facebook: "person.2.fill"
+        case .custom: "server.rack"
+        }
+    }
+}

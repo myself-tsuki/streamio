@@ -273,87 +273,180 @@ struct ControlsDock: View {
     @Environment(StudioController.self) private var studio
 
     var body: some View {
-        let enabledCount = studio.destinations.filter(\.isEnabled).count
         DockPanel(title: "Controls") {
-            VStack(spacing: Theme.spacingS) {
-                Button(action: studio.toggleStreaming) {
-                    Label(studio.streamStatus.isActive ? "Stop Streaming" : "Start Streaming",
-                          systemImage: studio.streamStatus.isActive ? "stop.fill" : "dot.radiowaves.left.and.right")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glassProminent)
-                .tint(studio.streamStatus.isActive ? Theme.live : .accentColor)
-
-                // Separate Destinations Control
-                Menu {
-                    if studio.destinations.isEmpty {
-                        Text("No destinations configured")
-                    } else {
-                        ForEach(studio.destinations) { destination in
-                            Toggle(destination.name, isOn: Binding(
-                                get: { studio.destinations.first { $0.id == destination.id }?.isEnabled ?? false },
-                                set: { value in
-                                    if let index = studio.destinations.firstIndex(where: { $0.id == destination.id }) {
-                                        studio.destinations[index].isEnabled = value
-                                    }
-                                }
-                            ))
-                        }
+            GlassEffectContainer(spacing: Theme.spacingS) {
+                VStack(spacing: Theme.spacingS) {
+                    Button(action: studio.toggleStreaming) {
+                        Label(studio.streamStatus.isActive ? "Stop Streaming" : "Start Streaming",
+                              systemImage: studio.streamStatus.isActive ? "stop.fill" : "dot.radiowaves.left.and.right")
+                            .font(.body.weight(.semibold))
+                            .frame(maxWidth: .infinity)
                     }
+                    .buttonStyle(.glassProminent)
+                    .tint(studio.streamStatus.isActive ? Theme.live : .accentColor)
+
+                    DestinationPickerPill()
+
                     Divider()
-                    SettingsLink {
-                        Label("Manage Destinations…", systemImage: "slider.horizontal.3")
-                    }
-                } label: {
-                    HStack(spacing: Theme.spacingS) {
-                        Image(systemName: "antenna.radiowaves.left.and.right")
-                            .foregroundStyle(enabledCount > 0 ? Color.accentColor : Color.secondary)
-                        Text(enabledCount == 0 ? "No Destinations" : (enabledCount == 1 ? "1 Destination" : "\(enabledCount) Destinations"))
-                            .font(.body.weight(.medium))
-                            .lineLimit(1)
-                        Spacer()
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.caption2.bold())
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, Theme.spacingL)
-                    .frame(maxWidth: .infinity, minHeight: 38)
-                    .glassEffect(.regular, in: .rect(cornerRadius: Theme.rowRadius))
-                    .contentShape(.rect(cornerRadius: Theme.rowRadius))
-                }
-                .menuStyle(.borderlessButton)
-                .help("Select destinations for streaming")
+                        .padding(.vertical, Theme.spacingXS)
 
-                Button(action: studio.toggleRecording) {
-                    Label(studio.isRecording ? "Stop Recording" : "Start Recording",
-                          systemImage: studio.isRecording ? "stop.circle.fill" : "record.circle")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glass)
-                .tint(studio.isRecording ? Theme.live : nil)
-
-                Button {
-                    studio.setFullscreenPreview(true)
-                } label: {
-                    Label("Fullscreen Preview", systemImage: "arrow.up.left.and.arrow.down.right").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glass)
-
-                HStack(spacing: Theme.spacingS) {
-                    Button(action: studio.revealRecordings) {
-                        Label("Recordings", systemImage: "folder").frame(maxWidth: .infinity)
+                    Button(action: studio.toggleRecording) {
+                        Label(studio.isRecording ? "Stop Recording" : "Start Recording",
+                              systemImage: studio.isRecording ? "stop.circle.fill" : "record.circle")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.glass)
-                    .help("Show recordings in Finder")
+                    .tint(studio.isRecording ? Theme.live : nil)
+
+                    HStack(spacing: Theme.spacingS) {
+                        Button(action: studio.revealRecordings) {
+                            Label("Recordings", systemImage: "folder").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glass)
+                        .help("Show recordings in Finder (Movies ▸ Streamio)")
+
+                        Button {
+                            studio.setFullscreenPreview(true)
+                        } label: {
+                            Label("Fullscreen", systemImage: "arrow.up.left.and.arrow.down.right").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glass)
+                        .help("Show only the program output, full screen (⇧⌘F)")
+                    }
 
                     SettingsLink {
                         Label("Settings", systemImage: "gearshape").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.glass)
                 }
+                .buttonBorderShape(.capsule)
+                .controlSize(.large)
             }
+        }
+    }
+}
+
+/// The destinations selector under "Start Streaming": a Liquid Glass pill that opens a glass
+/// popover of switches. A custom popover rather than a `Menu`, because macOS drops a menu
+/// label's background and shape, which left the old selector as bare text.
+struct DestinationPickerPill: View {
+    @Environment(StudioController.self) private var studio
+    @State private var isPresented = false
+
+    var body: some View {
+        let enabled = studio.destinations.filter(\.isEnabled)
+        Button {
+            isPresented.toggle()
+        } label: {
+            HStack(spacing: Theme.spacingS) {
+                Image(systemName: enabled.isEmpty ? "antenna.radiowaves.left.and.right.slash" : "antenna.radiowaves.left.and.right")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(enabled.isEmpty ? Color.secondary : Color.accentColor)
+                    .frame(width: 30, height: 30)
+                    .background(.fill.tertiary, in: .circle)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Go live on")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(summary(enabled))
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: Theme.spacingXS)
+                if enabled.count > 1 {
+                    Text("\(enabled.count)")
+                        .font(.caption.weight(.bold).monospacedDigit())
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.2), in: .capsule)
+                        .accessibilityHidden(true)
+                }
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isPresented ? 180 : 0))
+            }
+            .padding(.leading, 6)
+            .padding(.trailing, Theme.spacingM)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(.capsule)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(enabled.isEmpty ? .regular.interactive() : .regular.tint(Color.accentColor.opacity(0.12)).interactive(),
+                     in: .capsule)
+        .animation(.smooth(duration: 0.2), value: isPresented)
+        .help("Choose where Start Streaming goes live")
+        .accessibilityLabel("Destinations")
+        .accessibilityValue(summary(enabled))
+        .popover(isPresented: $isPresented, arrowEdge: .leading) {
+            DestinationPickerList()
+        }
+    }
+
+    private func summary(_ enabled: [StreamDestination]) -> String {
+        switch enabled.count {
+        case 0: studio.destinations.isEmpty ? String(localized: "Add a destination") : String(localized: "No destinations")
+        case 1: enabled[0].name
+        case 2: "\(enabled[0].name), \(enabled[1].name)"
+        default: String(localized: "\(enabled.count) destinations")
+        }
+    }
+}
+
+/// The popover behind the destination pill: one switch per destination plus a way to Settings.
+struct DestinationPickerList: View {
+    @Environment(StudioController.self) private var studio
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.spacingM) {
+            Text("Destinations")
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
+            if studio.destinations.isEmpty {
+                Text("Add YouTube, Facebook, Twitch or a custom RTMP server to start streaming.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                GlassEffectContainer(spacing: Theme.spacingXS) {
+                    VStack(spacing: Theme.spacingXS) {
+                        ForEach(studio.destinations) { destination in
+                            DestinationRow(destination: destination)
+                        }
+                    }
+                }
+                Text("One encode is shared by every destination.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            SettingsLink {
+                Label(studio.destinations.isEmpty ? "Add Destination…" : "Manage Destinations…",
+                      systemImage: studio.destinations.isEmpty ? "plus" : "slider.horizontal.3")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.capsule)
             .controlSize(.large)
         }
+        .padding(Theme.spacingL)
+        .frame(width: 300)
+    }
+}
+
+/// A round service glyph used in destination pills.
+struct ServiceBadge: View {
+    let service: StreamingService
+    var isOn: Bool = true
+
+    var body: some View {
+        Image(systemName: service.systemImage)
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(isOn ? Color.accentColor : Color.secondary)
+            .frame(width: 30, height: 30)
+            .background(.fill.tertiary, in: .circle)
+            .accessibilityHidden(true)
     }
 }
 
@@ -369,14 +462,14 @@ struct DestinationsDock: View {
                     Text("No destinations. Add YouTube, Facebook, Twitch or a custom RTMP server in Settings ▸ Stream.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                ForEach(studio.destinations) { destination in
-                    DestinationRow(destination: destination)
-                }
-                if studio.destinations.count > 1 {
-                    Text("One encode is shared by every destination.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                GlassEffectContainer(spacing: Theme.spacingXS) {
+                    VStack(spacing: Theme.spacingXS) {
+                        ForEach(studio.destinations) { destination in
+                            DestinationRow(destination: destination)
+                        }
+                    }
                 }
             }
         } accessory: {
@@ -388,6 +481,8 @@ struct DestinationsDock: View {
     }
 }
 
+/// One destination as a glass pill: service glyph, name, live status and an include switch
+/// (or a per-destination start/stop button while the stream is up).
 struct DestinationRow: View {
     @Environment(StudioController.self) private var studio
     let destination: StreamDestination
@@ -403,13 +498,10 @@ struct DestinationRow: View {
             }
         )
         HStack(spacing: Theme.spacingS) {
-            Toggle("Include \(destination.name) when going live", isOn: enabled)
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-                .disabled(status.isActive)
-            VStack(alignment: .leading, spacing: 1) {
+            ServiceBadge(service: destination.service, isOn: enabled.wrappedValue)
+            VStack(alignment: .leading, spacing: 0) {
                 Text(destination.name)
-                    .font(.subheadline.bold())
+                    .font(.callout.weight(.semibold))
                     .lineLimit(1)
                 HStack(spacing: Theme.spacingXS) {
                     Image(systemName: status.systemImage)
@@ -420,6 +512,7 @@ struct DestinationRow: View {
                     }
                 }
                 .font(.caption)
+                .lineLimit(1)
                 .foregroundStyle(status == .idle ? Color.secondary : status.tint)
             }
             Spacer(minLength: 0)
@@ -429,12 +522,28 @@ struct DestinationRow: View {
                     studio.toggleDestination(destination.id)
                 }
                 .labelStyle(.iconOnly)
-                .buttonStyle(.borderless)
-                .frame(minWidth: 28, minHeight: 28)
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .controlSize(.small)
                 .help(status.isActive ? "Stop this destination only" : "Add this destination to the live stream")
+            } else {
+                Toggle("Include \(destination.name) when going live", isOn: enabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
             }
         }
-        .padding(.vertical, 2)
+        .padding(.leading, 6)
+        .padding(.trailing, Theme.spacingM)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .glassEffect(rowGlass(status: status, isOn: enabled.wrappedValue), in: .capsule)
+    }
+
+    private func rowGlass(status: StreamStatus, isOn: Bool) -> Glass {
+        if status.isLive { return .regular.tint(Theme.live.opacity(0.3)) }
+        if status.isActive { return .regular.tint(Theme.warning.opacity(0.25)) }
+        return isOn ? .regular.tint(Color.accentColor.opacity(0.15)) : .regular
     }
 }
 

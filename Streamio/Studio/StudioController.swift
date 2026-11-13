@@ -25,7 +25,19 @@ final class StudioController {
     var keyFrameInterval: Double = 2 { didSet { save() } }
     var audioBitrate: AudioBitrate = .kbps160 { didSet { save() } }
     var recordingFormat: RecordingFormat = .mp4 { didSet { save() } }
-    var recordingDirectory: URL = URL.moviesDirectory { didSet { save() } }
+    var recordingDirectory: URL = StudioController.defaultRecordingDirectory { didSet { save() } }
+
+    /// ~/Movies/Streamio. Created on demand when recording starts or the folder is revealed.
+    nonisolated static var defaultRecordingDirectory: URL {
+        URL.moviesDirectory.appending(path: "Streamio", directoryHint: .isDirectory)
+    }
+
+    /// Earlier builds saved plain ~/Movies; move those users into the Streamio subfolder.
+    private static func migratedRecordingDirectory(_ url: URL) -> URL {
+        url.standardizedFileURL.path(percentEncoded: false).trimmingSuffix("/")
+            == URL.moviesDirectory.standardizedFileURL.path(percentEncoded: false).trimmingSuffix("/")
+            ? defaultRecordingDirectory : url
+    }
     var autoReconnect = true { didSet { save() } }
     var showsCursor = true { didSet { save(); reconfigureCapture() } }
     /// Mixer channels the user added. Empty by default: nothing is captured until a source is added.
@@ -447,6 +459,7 @@ final class StudioController {
         if let lastRecordingURL, FileManager.default.fileExists(atPath: lastRecordingURL.path(percentEncoded: false)) {
             NSWorkspace.shared.activateFileViewerSelecting([lastRecordingURL])
         } else {
+            try? FileManager.default.createDirectory(at: recordingDirectory, withIntermediateDirectories: true)
             NSWorkspace.shared.open(recordingDirectory)
         }
     }
@@ -692,7 +705,7 @@ final class StudioController {
             keyFrameInterval = snapshot.keyFrameInterval
             audioBitrate = snapshot.audioBitrate
             recordingFormat = snapshot.recordingFormat
-            recordingDirectory = snapshot.recordingDirectory
+            recordingDirectory = Self.migratedRecordingDirectory(snapshot.recordingDirectory)
             autoReconnect = snapshot.autoReconnect
             showsCursor = snapshot.showsCursor
             audioSources = snapshot.audioSources
@@ -714,8 +727,14 @@ final class StudioController {
         keyFrameInterval = legacy.keyFrameInterval
         audioBitrate = legacy.audioBitrate
         recordingFormat = legacy.recordingFormat
-        recordingDirectory = legacy.recordingDirectory
+        recordingDirectory = Self.migratedRecordingDirectory(legacy.recordingDirectory)
         autoReconnect = legacy.autoReconnect
         showsCursor = legacy.showsCursor
+    }
+}
+
+private extension String {
+    func trimmingSuffix(_ suffix: String) -> String {
+        hasSuffix(suffix) ? String(dropLast(suffix.count)) : self
     }
 }

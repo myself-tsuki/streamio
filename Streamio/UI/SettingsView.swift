@@ -182,7 +182,13 @@ struct OutputSettingsPane: View {
                     ForEach(RecordingFormat.allCases) { Text($0.title).tag($0) }
                 }
                 LabeledContent("Folder") {
-                    Text(studio.recordingDirectory.path(percentEncoded: false)).lineLimit(1).truncationMode(.middle)
+                    HStack(spacing: Theme.spacingS) {
+                        Text(studio.recordingDirectory.path(percentEncoded: false)).lineLimit(1).truncationMode(.middle)
+                        Button("Show in Finder", systemImage: "folder", action: studio.revealRecordings)
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.borderless)
+                            .help("Show recordings in Finder")
+                    }
                 }
                 Text("Recordings reuse the stream encoder, so each frame is encoded only once.")
                     .font(.callout).foregroundStyle(.secondary)
