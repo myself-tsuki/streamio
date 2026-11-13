@@ -10,5 +10,6 @@ swiftc -swift-version 5 RTMP/AMF0.swift RTMP/RTMPChunker.swift RTMP/RTMPChunkRea
   Models/SceneSource.swift Models/VideoSource.swift Models/StudioScene.swift Models/FilterType.swift \
   Models/FilterParameters.swift Models/AudioSourceConfig.swift Models/AudioChannelID.swift \
   Models/StreamDestination.swift Models/StreamingService.swift Models/IngestServer.swift Metal/CanvasPlacement.swift \
+  Models/StatWidget.swift Studio/WidgetLayout.swift \
   ../scripts/ProtocolChecks/LinuxShims.swift ../scripts/ProtocolChecks/main.swift -o "$out"
 "$out"

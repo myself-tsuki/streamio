@@ -65,3 +65,28 @@ precondition(twoCams.cameraSource?.name == "Main" && twoCams.extraCameraSources.
 let legacy = #"{"id":"\#(UUID().uuidString)","name":"Old","input":{"image":{"path":"/x.png"}},"isVisible":true,"layout":"fit","pipScale":0.3,"isMirrored":false,"opacity":1,"filter":"passthrough","adjustments":{"brightness":0,"contrast":1,"saturation":1,"intensity":1}}"#
 let old = try! JSONDecoder().decode(SceneSource.self, from: Data(legacy.utf8))
 precondition(old.shape == .rectangle && old.borderWidth == 0, "legacy source")
+
+// Preview widgets: resizing snaps to whole cells, keeps dials square, never overlaps a
+// neighbour, and layouts saved before resizing existed still load.
+let widgets = WidgetLayout(defaults: nil)
+widgets.grid = [StatWidget(metric: .cpu, style: .number, column: 0, row: 0),
+                StatWidget(metric: .gpu, style: .number, column: 6, row: 0),
+                StatWidget(metric: .bitrate, style: .gauge, column: 0, row: 3)]
+let cpuID = widgets.grid[0].id, gaugeID = widgets.grid[2].id
+widgets.resize(cpuID, columns: 4, rows: 2, rows: 6)
+precondition(widgets.grid[0].gridSize == (4, 2), "resize \(widgets.grid[0].gridSize)")
+widgets.resize(cpuID, columns: 9, rows: 2, rows: 6)
+precondition(widgets.grid[0].gridSize == (6, 2), "stops at neighbour \(widgets.grid[0].gridSize)")
+widgets.resize(cpuID, columns: 1, rows: 0, rows: 6)
+precondition(widgets.grid[0].gridSize == (2, 1) && widgets.grid[0].width == nil, "min size")
+widgets.resize(gaugeID, columns: 5, rows: 2, rows: 6)
+precondition(widgets.grid[2].gridSize == (3, 3), "gauge square, inside 6 rows \(widgets.grid[2].gridSize)")
+widgets.step(gaugeID, by: -1, rows: 6)
+precondition(widgets.grid[2].gridSize == (2, 2), "step down")
+precondition(widgets.canGrow(gaugeID, rows: 6), "can grow")
+widgets.setGridStyle(cpuID, .gauge, rows: 6)
+precondition(widgets.grid[0].gridSize == (2, 2), "style resets size")
+let oldWidget = #"{"id":"\#(UUID().uuidString)","metric":"cpu","style":"number","column":3,"row":1}"#
+let legacyWidget = try! JSONDecoder().decode(StatWidget.self, from: Data(oldWidget.utf8))
+precondition(legacyWidget.gridSize == (2, 1) && legacyWidget.column == 3, "legacy widget")
+print("WIDGET_CHECKS_OK")

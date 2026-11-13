@@ -82,7 +82,7 @@ nonisolated enum WidgetStyle: String, Codable, CaseIterable, Identifiable, Senda
         }
     }
 
-    /// Cells covered on the preview grid.
+    /// Smallest cells covered on the preview grid; widgets can be resized up from here.
     var gridSize: (columns: Int, rows: Int) {
         switch self {
         case .label, .number: (2, 1)
@@ -98,4 +98,30 @@ nonisolated struct StatWidget: Identifiable, Codable, Equatable, Sendable {
     var style: WidgetStyle
     var column = 0
     var row = 0
+    /// Columns and rows covered on the preview grid when resized; nil means the style's
+    /// smallest size. Optional so layouts saved before resizing existed still decode.
+    var width: Int?
+    var height: Int?
+
+    /// Cells this widget asks for on the preview grid. Never smaller than its style allows,
+    /// and a speedometer always stays square so the dial keeps its shape.
+    var gridSize: (columns: Int, rows: Int) {
+        StatWidget.size(style: style, columns: width, rows: height)
+    }
+
+    /// Size multiple shown in the UI: 1 at the smallest size.
+    var scale: Int {
+        max(1, gridSize.rows / style.gridSize.rows)
+    }
+
+    static func size(style: WidgetStyle, columns: Int?, rows: Int?) -> (columns: Int, rows: Int) {
+        let base = style.gridSize
+        let wantedColumns = max(base.columns, columns ?? base.columns)
+        let wantedRows = max(base.rows, rows ?? base.rows)
+        if style == .gauge {
+            let side = max(wantedColumns, wantedRows)
+            return (side, side)
+        }
+        return (wantedColumns, wantedRows)
+    }
 }
