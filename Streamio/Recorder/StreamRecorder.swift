@@ -41,6 +41,7 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
     private var audioInput: AVAssetWriterInput?
     private var sessionStart: CMTime?
     private var isActive = false
+    private var pendingAudio: [CMSampleBuffer] = []
 
     public init() {}
 
@@ -56,6 +57,7 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
             videoInput = nil
             audioInput = nil
             sessionStart = nil
+            pendingAudio.removeAll()
             isActive = true
         }
         return url
@@ -91,9 +93,11 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
         queue.async { [self] in
             guard isActive, let writer, writer.status == .writing, let audioInput, let sessionStart else { return }
             guard CMSampleBufferGetPresentationTimeStamp(sample) >= sessionStart else { return }
-            if audioInput.isReadyForMoreMediaData {
-                audioInput.append(sample)
-            }
+            // If the writer is briefly busy (a disk flush), keep the audio and send it in order
+            // when it is ready, instead of leaving a hole in the recording.
+            pendingAudio.append(sample)
+            drainPendingAudio(into: audioInput)
+            if pendingAudio.count > 500 { pendingAudio.removeFirst(pendingAudio.count - 500) }
         }
     }
 
@@ -108,6 +112,7 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
                 onEvent?(.failed(String(localized: "Recording stopped before any video was written.")))
                 return
             }
+            if let audioInput { drainPendingAudio(into: audioInput) }
             videoInput?.markAsFinished()
             audioInput?.markAsFinished()
             let url = outputURL
@@ -125,6 +130,13 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
     }
 
     // MARK: - Private
+
+    private func drainPendingAudio(into input: AVAssetWriterInput) {
+        while let first = pendingAudio.first, input.isReadyForMoreMediaData {
+            input.append(first)
+            pendingAudio.removeFirst()
+        }
+    }
 
     private func createWriter(for sampleBuffer: CMSampleBuffer) -> Bool {
         guard let settings, let outputURL,
@@ -177,6 +189,7 @@ nonisolated public final class StreamRecorder: @unchecked Sendable {
     }
 
     private func resetState() {
+        pendingAudio.removeAll()
         writer = nil
         videoInput = nil
         audioInput = nil

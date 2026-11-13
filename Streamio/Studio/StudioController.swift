@@ -45,6 +45,10 @@ final class StudioController {
         didSet {
             UserDefaults.standard.set(adaptiveBitrate, forKey: "studio.adaptiveBitrate")
             pipeline.setAdaptiveBitrate(adaptiveBitrate)
+        // Without this macOS can "nap" the app when its window is covered (a game in front, a
+        // screensaver) and delay the audio and video timers, which sounds like sudden dropouts.
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical], reason: "Streamio is capturing, mixing and streaming live")
         }
     }
     var showsCursor = true { didSet { save(); reconfigureCapture() } }
@@ -91,6 +95,7 @@ final class StudioController {
     @ObservationIgnored private let monitor = SystemMonitor()
     @ObservationIgnored private var statsTask: Task<Void, Never>?
     @ObservationIgnored private var isPinging = false
+    @ObservationIgnored private var activityToken: NSObjectProtocol?
     @ObservationIgnored private var isLoading = true
     private var streamKeys: [UUID: String] = [:]
     @ObservationIgnored private var activeCameraID: String?

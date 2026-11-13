@@ -9,6 +9,16 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import QuartzCore
+
+/// Remembers when audio last arrived, so a capture session that went quiet can be restarted.
+nonisolated final class AudioHeartbeat: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = CACurrentMediaTime()
+
+    func beat() { lock.withLock { last = CACurrentMediaTime() } }
+    var silence: Double { lock.withLock { CACurrentMediaTime() - last } }
+}
 
 nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     var onAudio: (@Sendable (CMSampleBuffer) -> Void)?
@@ -20,6 +30,8 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
     private let sessionQueue = DispatchQueue(label: "com.streamio.capture.aux.session", qos: .userInitiated)
     private var input: AVCaptureDeviceInput?
     private var runtimeErrorObserver: NSObjectProtocol?
+    private let heartbeat = AudioHeartbeat()
+    private var watchdog: DispatchSourceTimer?
 
     override init() {
         super.init()
@@ -33,6 +45,17 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
             AVLinearPCMIsNonInterleaved: true
         ]
         output.setSampleBufferDelegate(self, queue: queue)
+        // A USB device that hiccups can leave the session running but silent. Restart it.
+        let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.input != nil, self.session.isRunning, self.heartbeat.silence > 3 else { return }
+            self.session.stopRunning()
+            self.session.startRunning()
+            self.heartbeat.beat()
+        }
+        timer.resume()
+        watchdog = timer
         runtimeErrorObserver = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
         ) { [weak self] notification in
@@ -73,6 +96,7 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
                 session.commitConfiguration()
             }
             if input != nil, !session.isRunning {
+                heartbeat.beat()
                 session.startRunning()
             } else if input == nil, session.isRunning {
                 session.stopRunning()
@@ -81,6 +105,7 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        heartbeat.beat()
         onAudio?(sampleBuffer)
     }
 }

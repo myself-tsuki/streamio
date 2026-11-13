@@ -70,8 +70,12 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
     private let mixQueue = DispatchQueue(label: "com.streamio.mixer.clock", qos: .userInteractive)
     private var mixTimer: DispatchSourceTimer?
     private let chunkFrames = 1_024
-    /// A channel starts playing once this much is buffered (32 ms), so bursty delivery never underruns.
-    private let primeFrames = 1_536
+    /// A channel starts playing once this much is buffered (43 ms), so bursty delivery never underruns.
+    private let primeFrames = 2_048
+    /// The buffer may wander this far from the target before the speed is nudged.
+    private let steerBand = 768
+    private var scratchLeft = [Float](repeating: 0, count: 1_024)
+    private var scratchRight = [Float](repeating: 0, count: 1_024)
     /// More than this queued (150 ms) means the source runs fast; trim back to the cushion.
     private let maxBufferedFrames = 7_200
     /// Audio is stamped a little early to account for the cushion and device latency (A/V sync).
@@ -106,9 +110,12 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
     }
 
     /// Emits every chunk that is due on the wall clock, so a late tick catches up exactly.
+    /// The mix is built under the lock, but encoders, the recorder and the meters are called after
+    /// it is released: a slow AAC encode or disk write must never block the capture queues.
     private func mixTick() {
+        var outputs: [(AVAudioPCMBuffer, Double)] = []
+        var levels: [AudioChannelID: AudioLevels]?
         lock.lock()
-        defer { lock.unlock() }
         let now = Self.hostSeconds()
         let start = timelineStart ?? now
         timelineStart = start
@@ -121,11 +128,15 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         }
         while due >= Int64(chunkFrames) {
             let time = (timelineStart ?? now) + Double(emittedFrames) / Self.sampleRate - latencyCompensation
-            emitMix(frames: chunkFrames, time: time)
+            if let buffer = makeMix(frames: chunkFrames) { outputs.append((buffer, time)) }
             emittedFrames += Int64(chunkFrames)
             due -= Int64(chunkFrames)
         }
-        publishMetersIfNeeded(now: now)
+        levels = collectMeters(now: now)
+        lock.unlock()
+
+        for (buffer, time) in outputs { onMixedAudio?(buffer, time) }
+        if let levels { onLevels?(levels) }
     }
 
     public func setSettings(_ newSettings: ChannelSettings, for channel: AudioChannelID) {
@@ -183,18 +194,21 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         lastArrival[channel] = Self.hostSeconds()
     }
 
-    private func emitMix(frames: Int, time: Double) {
+    /// Builds one chunk of the mix. Called with the lock held.
+    ///
+    /// Each device's clock runs a hair faster or slower than the Mac's (50–200 ppm). Left alone,
+    /// its buffer would slowly drain until it underruns and clicks every few minutes. So the buffer
+    /// level is steered toward a target by consuming one frame more or fewer per chunk, a ≤0.1 %
+    /// speed change nobody can hear.
+    private func makeMix(frames: Int) -> AVAudioPCMBuffer? {
         guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: AVAudioFrameCount(frames)),
               let outLeft = output.floatChannelData?[0],
-              let outRight = output.floatChannelData?[1] else { return }
+              let outRight = output.floatChannelData?[1] else { return nil }
         output.frameLength = AVAudioFrameCount(frames)
         vDSP_vclr(outLeft, 1, vDSP_Length(frames))
         vDSP_vclr(outRight, 1, vDSP_Length(frames))
 
-        let leftBuffer = UnsafeMutableBufferPointer(start: outLeft, count: frames)
-        let rightBuffer = UnsafeMutableBufferPointer(start: outRight, count: frames)
         for channel in AudioChannelID.allCases {
-            // Mutate in place: copying a ring out of the dictionary would copy its storage.
             guard var available = rings[channel]?.availableFrames else { continue }
             if primed[channel] != true {
                 guard available >= primeFrames else { continue }
@@ -205,10 +219,31 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
                 available = primeFrames
             }
             if available < frames {
-                // Underrun: play what there is, then wait for the cushion to refill.
+                // A real stall: play what there is, then wait for the cushion to refill.
                 primed[channel] = false
             }
-            rings[channel]?.mix(into: leftBuffer, rightBuffer, count: frames, gain: 1)
+
+            // Steer the buffer level toward the target.
+            var take = frames
+            if available > primeFrames + steerBand, available > frames + 1 {
+                rings[channel]?.skip(1)          // source is fast: drop one frame
+            } else if available < primeFrames - steerBand, available >= frames {
+                take = frames - 1                // source is slow: stretch by one frame
+            }
+
+            scratchLeft.withUnsafeMutableBufferPointer { left in
+                scratchRight.withUnsafeMutableBufferPointer { right in
+                    vDSP_vclr(left.baseAddress!, 1, vDSP_Length(frames))
+                    vDSP_vclr(right.baseAddress!, 1, vDSP_Length(frames))
+                    rings[channel]?.mix(into: left, right, count: take, gain: 1)
+                    if take < frames, take > 0 {
+                        left[frames - 1] = left[take - 1]
+                        right[frames - 1] = right[take - 1]
+                    }
+                    vDSP_vadd(outLeft, 1, left.baseAddress!, 1, outLeft, 1, vDSP_Length(frames))
+                    vDSP_vadd(outRight, 1, right.baseAddress!, 1, outRight, 1, vDSP_Length(frames))
+                }
+            }
         }
 
         // Soft safety clip so summed channels never wrap.
@@ -216,8 +251,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         var high: Float = 1
         vDSP_vclip(outLeft, 1, &low, &high, outLeft, 1, vDSP_Length(frames))
         vDSP_vclip(outRight, 1, &low, &high, outRight, 1, vDSP_Length(frames))
-
-        onMixedAudio?(output, time)
+        return output
     }
 
     // MARK: - Metering
@@ -240,8 +274,8 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
         meters[channel] = accumulator
     }
 
-    private func publishMetersIfNeeded(now: Double) {
-        guard now - lastMeterPublish >= meterInterval || now < lastMeterPublish else { return }
+    private func collectMeters(now: Double) -> [AudioChannelID: AudioLevels]? {
+        guard now - lastMeterPublish >= meterInterval || now < lastMeterPublish else { return nil }
         lastMeterPublish = now
 
         var readings: [AudioChannelID: AudioLevels] = [:]
@@ -260,7 +294,7 @@ nonisolated public final class AudioMixer: @unchecked Sendable {
             )
         }
         meters.removeAll(keepingCapacity: true)
-        onLevels?(readings)
+        return readings
     }
 
     // MARK: - Format conversion

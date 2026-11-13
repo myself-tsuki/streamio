@@ -27,6 +27,8 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
     private var videoInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
     private var runtimeErrorObserver: NSObjectProtocol?
+    private let heartbeat = AudioHeartbeat()
+    private var watchdog: DispatchSourceTimer?
     /// Device + canvas the active format was chosen for. Re-locking a camera that is already
     /// configured makes many USB webcams restart their stream, which shows as black blinks.
     private var appliedFormatKey: String?
@@ -58,6 +60,18 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
             if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
             session.commitConfiguration()
         }
+
+        // A USB microphone that hiccups can leave the session running but silent. Restart it.
+        let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.audioInput != nil, self.session.isRunning, self.heartbeat.silence > 3 else { return }
+            self.session.stopRunning()
+            self.session.startRunning()
+            self.heartbeat.beat()
+        }
+        timer.resume()
+        watchdog = timer
 
         runtimeErrorObserver = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
@@ -132,6 +146,7 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
 
             let needsSession = videoInput != nil || audioInput != nil
             if needsSession, !session.isRunning {
+                heartbeat.beat()
                 session.startRunning()
             } else if !needsSession, session.isRunning {
                 session.stopRunning()
@@ -188,6 +203,7 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
         if output === videoOutput {
             onVideo?(sampleBuffer)
         } else if output === audioOutput {
+            heartbeat.beat()
             onAudio?(sampleBuffer)
         }
     }
