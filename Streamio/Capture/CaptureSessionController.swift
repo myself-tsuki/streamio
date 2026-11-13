@@ -54,11 +54,11 @@ nonisolated public final class CaptureSessionController: NSObject, AVCaptureVide
         let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
         timer.schedule(deadline: .now() + 2, repeating: 2)
         timer.setEventHandler { [weak self] in
-            guard let self, self.audioInput != nil, self.session.isRunning, self.heartbeat.silence > 3 else { return }
-            DiagnosticsLog.log("capture", "audio input silent for \(Int(self.heartbeat.silence)) s: restarting capture session")
-            self.session.stopRunning()
-            self.session.startRunning()
-            self.heartbeat.beat()
+            guard let self, self.videoInput != nil || self.audioInput != nil else { return }
+            if !self.session.isRunning {
+                DiagnosticsLog.log("capture", "camera session is not running: starting it again")
+                self.session.startRunning()
+            }
         }
         timer.resume()
         watchdog = timer

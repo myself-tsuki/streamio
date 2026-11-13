@@ -39,15 +39,18 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
         self.name = name
         super.init()
         output.setSampleBufferDelegate(self, queue: queue)
-        // A USB device that hiccups can leave the session running but silent. Restart it.
+        // Watchdog: if the session stopped (macOS reports "Recording Stopped" when the audio device
+        // is taken over or renegotiated) or went silent, rebuild the input and start it again.
+        // It keeps trying every two seconds for as long as the device is present.
         let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
         timer.schedule(deadline: .now() + 2, repeating: 2)
         timer.setEventHandler { [weak self] in
-            guard let self, self.input != nil, self.session.isRunning, self.heartbeat.silence > 3 else { return }
-            DiagnosticsLog.log("capture", "audio input silent for \(Int(self.heartbeat.silence)) s: restarting capture session")
-            self.session.stopRunning()
-            self.session.startRunning()
-            self.heartbeat.beat()
+            guard let self, self.deviceID != nil else { return }
+            if !self.session.isRunning {
+                self.recover(reason: "session is not running")
+            } else if self.heartbeat.silence > 3 {
+                self.recover(reason: "no audio for \(Int(self.heartbeat.silence)) s")
+            }
         }
         timer.resume()
         watchdog = timer
@@ -55,12 +58,31 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
             forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
         ) { [weak self] notification in
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
-            self?.onError?(error?.localizedDescription ?? String(localized: "\(self?.name ?? "The audio input") stopped unexpectedly."))
-            self?.sessionQueue.asyncAfter(deadline: .now() + 1) {
-                guard let self, self.input != nil, !self.session.isRunning else { return }
-                self.session.startRunning()
-            }
+            DiagnosticsLog.log("capture", "\(self?.name ?? "audio input") runtime error: \(error?.localizedDescription ?? "unknown")")
+            self?.sessionQueue.asyncAfter(deadline: .now() + 0.5) { self?.recover(reason: "runtime error") }
         }
+    }
+
+    /// The device the user chose, while it is connected. The watchdog works toward keeping it running.
+    private var deviceID: String?
+
+    /// Rebuilds the input from a fresh device object and restarts the session. Runs on `sessionQueue`.
+    private func recover(reason: String) {
+        guard let id = deviceID else { return }
+        guard let device = AVCaptureDevice(uniqueID: id), device.isConnected else { return }
+        DiagnosticsLog.log("capture", "\(name): recovering (\(reason))")
+        session.beginConfiguration()
+        if let input { session.removeInput(input) }
+        input = nil
+        if let newInput = try? AVCaptureDeviceInput(device: device), session.canAddInput(newInput) {
+            session.addInput(newInput)
+            input = newInput
+        }
+        if !session.outputs.contains(output), session.canAddOutput(output) { session.addOutput(output) }
+        session.commitConfiguration()
+        if session.isRunning { session.stopRunning() }
+        heartbeat.beat()
+        if input != nil { session.startRunning() }
     }
 
     deinit {
@@ -70,6 +92,7 @@ nonisolated final class AuxAudioCapture: NSObject, AVCaptureAudioDataOutputSampl
     /// Uses `device`, or stops when it is nil (not added, or unplugged).
     func configure(device: AVCaptureDevice?) {
         sessionQueue.async { [self] in
+            deviceID = device?.uniqueID
             if input?.device != device {
                 session.beginConfiguration()
                 if let input { session.removeInput(input) }
